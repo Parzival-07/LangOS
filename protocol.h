@@ -31,6 +31,10 @@ typedef enum {
     // View operations (Client <-> NM)
     CMD_VIEW_FILES = 310,        // Client -> NM (request)
     CMD_VIEW_FILES_RESP = 311    // NM -> Client (response)
+    ,
+    // NM <-> SS synchronization
+    CMD_SS_LIST_FILES = 320,       // NM -> SS (request)
+    CMD_SS_LIST_FILES_RESP = 321   // SS -> NM (response)
 } CommandCode;
 
 // --- DATA STRUCTURES ---
@@ -75,6 +79,12 @@ typedef struct {
 typedef struct {
     char file_list[16384];
 } MsgViewFilesResponse;
+
+// Data for SS file listing response
+// SS -> NM
+typedef struct {
+    char files[16384]; // newline-separated content filenames (exclude .meta)
+} MsgSSFileListResponse;
 
 
 // --- HELPER FUNCTIONS ---
