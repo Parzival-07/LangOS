@@ -64,6 +64,7 @@ void send_ack(int socket);
 static int choose_ss_slot(void);
 static void send_error(int socket, int code, const char* msg);
 static void registry_add_file_if_absent(const char* filename, const char* owner);
+static void registry_refresh_from_ss(void);
 
 // --- MAIN SERVER LOGIC ---
 
@@ -313,6 +314,8 @@ void* handle_connection(void* arg) {
             }
             continue;
         } else if (header.command == CMD_VIEW_FILES && connections[slot].type == CONN_TYPE_CLIENT) {
+            // Before serving VIEW, refresh registry from connected SS to prune stale entries
+            registry_refresh_from_ss();
             // No payload expected for simple VIEW
             if (header.payload_size != 0) {
                 // Drain any unexpected payload
@@ -460,6 +463,101 @@ static void registry_add_file_if_absent(const char* filename, const char* owner)
     if (file_count < MAX_FILES) {
         strncpy(file_registry[file_count].filename, filename, MAX_FILENAME_LEN - 1);
         if (owner) strncpy(file_registry[file_count].owner, owner, MAX_USERNAME_LEN - 1);
+        file_count++;
+    }
+    pthread_mutex_unlock(&file_registry_mutex);
+}
+
+// Query all connected SS for their file lists and rebuild the registry (union)
+static void registry_refresh_from_ss(void) {
+    // Collect union into a simple local array (avoid dynamic alloc for MVP)
+    char union_list[32768];
+    size_t upos = 0, ucap = sizeof(union_list);
+
+    pthread_mutex_lock(&connections_mutex);
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connections[i].type != CONN_TYPE_SS || connections[i].socket < 0) continue;
+        int ss_sock = connections[i].socket;
+
+        // Send request
+        MsgHeader rq = {0};
+        rq.command = CMD_SS_LIST_FILES;
+        rq.payload_size = 0;
+        if (!send_all(ss_sock, &rq, sizeof(rq))) {
+            continue; // skip this SS
+        }
+
+        // Read response header
+        MsgHeader rs;
+        if (!recv_all(ss_sock, &rs, sizeof(rs))) {
+            continue;
+        }
+        if (rs.command != CMD_SS_LIST_FILES_RESP || rs.payload_size != sizeof(MsgSSFileListResponse)) {
+            // Drain payload if any
+            size_t rem = rs.payload_size;
+            char drain[512];
+            while (rem > 0) {
+                size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem;
+                if (!recv_all(ss_sock, drain, chunk)) break;
+                rem -= chunk;
+            }
+            continue;
+        }
+
+        // Read payload
+        MsgSSFileListResponse pl = {0};
+        if (!recv_all(ss_sock, &pl, sizeof(pl))) {
+            continue;
+        }
+
+        // Append to union_list (will dedupe later)
+        size_t len = strnlen(pl.files, sizeof(pl.files));
+        if (len == 0) continue;
+        if (upos + len >= ucap) len = ucap - upos - 1;
+        if (len > 0) {
+            memcpy(union_list + upos, pl.files, len);
+            upos += len;
+            union_list[upos] = '\0';
+        }
+    }
+    pthread_mutex_unlock(&connections_mutex);
+
+    // Rebuild registry from union_list (dedupe by filename)
+    // We'll scan union_list line by line and add unique names
+    char* cursor = union_list;
+    // Build a temp array to dedupe
+    char names[2048][MAX_FILENAME_LEN];
+    int ncount = 0;
+
+    while (cursor && *cursor) {
+        char* nl = strchr(cursor, '\n');
+        size_t l = nl ? (size_t)(nl - cursor) : strlen(cursor);
+        if (l > 0 && l < MAX_FILENAME_LEN) {
+            char tmp[MAX_FILENAME_LEN];
+            memcpy(tmp, cursor, l);
+            tmp[l] = '\0';
+            // dedupe
+            int found = 0;
+            for (int k = 0; k < ncount; k++) {
+                if (strncmp(names[k], tmp, MAX_FILENAME_LEN) == 0) { found = 1; break; }
+            }
+            if (!found && ncount < 2048) {
+                strncpy(names[ncount], tmp, MAX_FILENAME_LEN - 1);
+                names[ncount][MAX_FILENAME_LEN - 1] = '\0';
+                ncount++;
+            }
+        }
+        if (!nl) break;
+        cursor = nl + 1;
+    }
+
+    // Merge into registry: we’ll replace existing registry with the union
+    pthread_mutex_lock(&file_registry_mutex);
+    file_count = 0;
+    for (int i = 0; i < ncount && i < MAX_FILES; i++) {
+        strncpy(file_registry[file_count].filename, names[i], MAX_FILENAME_LEN - 1);
+        file_registry[file_count].filename[MAX_FILENAME_LEN - 1] = '\0';
+        file_registry[file_count].owner[0] = '\0'; // owner unknown after refresh
         file_count++;
     }
     pthread_mutex_unlock(&file_registry_mutex);

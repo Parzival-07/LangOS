@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <errno.h>
+#include <dirent.h>
 
 int client_listen_port;
 int nm_socket;
@@ -188,6 +189,54 @@ void* listen_to_nm(void* arg) {
                 } else {
                     printf("[SS] CREATE failed for '%s': %s\n", msg.filename, err);
                     nm_send_error(409, err[0] ? err : "CREATE failed");
+                }
+                break;
+            }
+            case CMD_SS_LIST_FILES: {
+                // No payload expected
+                if (header.payload_size != 0) {
+                    // Drain unexpected payload
+                    char drain[512];
+                    size_t remaining = header.payload_size;
+                    while (remaining > 0) {
+                        size_t chunk = remaining > sizeof(drain) ? sizeof(drain) : remaining;
+                        if (!recv_all(nm_socket, drain, chunk)) break;
+                        remaining -= chunk;
+                    }
+                }
+
+                MsgSSFileListResponse resp = {0};
+                size_t pos = 0, cap = sizeof(resp.files);
+
+                DIR* d = opendir(STORAGE_ROOT);
+                if (d) {
+                    struct dirent* de;
+                    while ((de = readdir(d)) != NULL) {
+                        // Skip . and ..
+                        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+                        // Skip metadata files ending with .meta
+                        size_t len = strlen(de->d_name);
+                        if (len >= 5 && strcmp(de->d_name + (len - 5), ".meta") == 0) continue;
+                        // Compose full path to check if it's a regular file
+                        char full[512];
+                        snprintf(full, sizeof(full), STORAGE_ROOT "/%s", de->d_name);
+                        struct stat st;
+                        if (stat(full, &st) == 0 && S_ISREG(st.st_mode)) {
+                            int n = snprintf(resp.files + pos, (pos < cap ? cap - pos : 0), "%s\n", de->d_name);
+                            if (n <= 0) break;
+                            if ((size_t)n >= (cap - pos)) { pos = cap - 1; break; }
+                            pos += (size_t)n;
+                        }
+                    }
+                    closedir(d);
+                }
+
+                MsgHeader h = {0};
+                h.command = CMD_SS_LIST_FILES_RESP;
+                h.payload_size = sizeof(resp);
+                if (!send_all(nm_socket, &h, sizeof(h)) ||
+                    !send_all(nm_socket, &resp, sizeof(resp))) {
+                    // NM likely disconnected; loop will break on next read
                 }
                 break;
             }
