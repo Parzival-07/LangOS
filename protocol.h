@@ -26,7 +26,11 @@ typedef enum {
     CMD_ERROR = 201,  // General failure
 
     // File operations
-    CMD_CREATE_FILE = 300
+    CMD_CREATE_FILE = 300,
+
+    // View operations (Client <-> NM)
+    CMD_VIEW_FILES = 310,        // Client -> NM (request)
+    CMD_VIEW_FILES_RESP = 311    // NM -> Client (response)
 } CommandCode;
 
 // --- DATA STRUCTURES ---
@@ -63,6 +67,14 @@ typedef struct {
     char filename[MAX_FILENAME_LEN];
     char owner[MAX_USERNAME_LEN];
 } MsgCreateFile;
+
+// Data for VIEW response
+// NM -> Client
+// Contains a newline-separated list of filenames the NM knows about
+// Note: MVP fixed buffer; truncate if larger
+typedef struct {
+    char file_list[16384];
+} MsgViewFilesResponse;
 
 
 // --- HELPER FUNCTIONS ---
