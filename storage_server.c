@@ -91,6 +91,28 @@ static int ss_create_file_do(const MsgCreateFile* m, char* errbuf, size_t errlen
     return 0;
 }
 
+// Delete the content file and its metadata. Returns 0 on success, -1 on failure.
+static int ss_delete_file_do(const char* filename) {
+    if (!is_valid_filename(filename)) {
+        return -1;
+    }
+    if (ensure_dir(STORAGE_ROOT) != 0) {
+        return -1;
+    }
+    char txt[512], meta[512];
+    snprintf(txt, sizeof(txt),  STORAGE_ROOT "/%s",       filename);
+    snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", filename);
+
+    // Attempt to remove both files; both must succeed per spec
+    if (remove(txt) != 0) {
+        return -1;
+    }
+    if (remove(meta) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 /**
  * @brief Thread to listen for direct Client connections (for READ, WRITE, etc.)
  */
@@ -193,9 +215,8 @@ void* listen_to_nm(void* arg) {
                 break;
             }
             case CMD_SS_LIST_FILES: {
-                // No payload expected
-                if (header.payload_size != 0) {
-                    // Drain unexpected payload
+                // Drain any unexpected payload
+                if (header.payload_size > 0) {
                     char drain[512];
                     size_t remaining = header.payload_size;
                     while (remaining > 0) {
@@ -210,23 +231,22 @@ void* listen_to_nm(void* arg) {
 
                 DIR* d = opendir(STORAGE_ROOT);
                 if (d) {
-                    struct dirent* de;
-                    while ((de = readdir(d)) != NULL) {
+                    struct dirent* ent;
+                    while ((ent = readdir(d)) != NULL) {
+                        const char* name = ent->d_name;
                         // Skip . and ..
-                        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-                        // Skip metadata files ending with .meta
-                        size_t len = strlen(de->d_name);
-                        if (len >= 5 && strcmp(de->d_name + (len - 5), ".meta") == 0) continue;
-                        // Compose full path to check if it's a regular file
-                        char full[512];
-                        snprintf(full, sizeof(full), STORAGE_ROOT "/%s", de->d_name);
-                        struct stat st;
-                        if (stat(full, &st) == 0 && S_ISREG(st.st_mode)) {
-                            int n = snprintf(resp.files + pos, (pos < cap ? cap - pos : 0), "%s\n", de->d_name);
-                            if (n <= 0) break;
-                            if ((size_t)n >= (cap - pos)) { pos = cap - 1; break; }
-                            pos += (size_t)n;
+                        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+                        // Skip metadata files
+                        size_t nlen = strlen(name);
+                        if (nlen > 5 && strcmp(name + nlen - 5, ".meta") == 0) continue;
+
+                        int n = snprintf(resp.files + pos, (pos < cap ? cap - pos : 0), "%s\n", name);
+                        if (n <= 0) break;
+                        if ((size_t)n >= (cap - pos)) { // truncated; stop
+                            pos = cap - 1;
+                            break;
                         }
+                        pos += (size_t)n;
                     }
                     closedir(d);
                 }
@@ -234,9 +254,28 @@ void* listen_to_nm(void* arg) {
                 MsgHeader h = {0};
                 h.command = CMD_SS_LIST_FILES_RESP;
                 h.payload_size = sizeof(resp);
-                if (!send_all(nm_socket, &h, sizeof(h)) ||
-                    !send_all(nm_socket, &resp, sizeof(resp))) {
-                    // NM likely disconnected; loop will break on next read
+                send_all(nm_socket, &h, sizeof(h));
+                send_all(nm_socket, &resp, sizeof(resp));
+                break;
+            }
+            case CMD_DELETE_FILE: {
+                if (header.payload_size != sizeof(MsgDeleteFile)) {
+                    nm_send_error(400, "Bad payload size");
+                    break;
+                }
+                MsgDeleteFile msg;
+                if (!recv_all(nm_socket, &msg, sizeof(msg))) {
+                    nm_send_error(400, "Payload read failed");
+                    break;
+                }
+                int rc = ss_delete_file_do(msg.filename);
+                if (rc == 0) {
+                    printf("[SS] Deleted file '%s'\n", msg.filename);
+                    MsgHeader ack = { .command = CMD_ACK, .payload_size = 0 };
+                    send_all(nm_socket, &ack, sizeof(ack));
+                } else {
+                    printf("[SS] DELETE failed for '%s'\n", msg.filename);
+                    nm_send_error(404, "DELETE failed");
                 }
                 break;
             }

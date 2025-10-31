@@ -1,0 +1,15 @@
+# Build outputs / binaries
+client
+name_server
+storage_server
+*.o
+*.out
+*.obj
+*.exe
+
+# Editor settings
+.vscode/
+.specstory/
+
+# Runtime data
+ss_data/
