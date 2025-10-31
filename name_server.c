@@ -359,6 +359,68 @@ void* handle_connection(void* arg) {
             continue;
         }
 
+        if (header.command == CMD_DELETE_FILE && connections[slot].type == CONN_TYPE_CLIENT) {
+            if (header.payload_size != sizeof(MsgDeleteFile)) {
+                send_error(socket, 400, "Bad payload size");
+                continue;
+            }
+            MsgDeleteFile payload;
+            if (!recv_all(socket, &payload, sizeof(payload))) {
+                send_error(socket, 400, "Failed to read payload");
+                continue;
+            }
+
+            int ss_slot = choose_ss_slot();
+            if (ss_slot < 0) {
+                printf("[NM] No Storage Server available for DELETE '%s'\n", payload.filename);
+                send_error(socket, 503, "No Storage Server available");
+                continue;
+            }
+
+            // Forward to SS
+            int ss_sock = connections[ss_slot].socket;
+            printf("[NM] Forwarding DELETE '%s' to SS at %s:%d (Slot %d)\n",
+                   payload.filename, connections[ss_slot].ip_addr, connections[ss_slot].client_port, ss_slot);
+
+            MsgHeader fwd = {0};
+            fwd.command = CMD_DELETE_FILE;
+            fwd.payload_size = sizeof(MsgDeleteFile);
+            if (!send_all(ss_sock, &fwd, sizeof(fwd)) ||
+                !send_all(ss_sock, &payload, sizeof(payload))) {
+                send_error(socket, 502, "Failed to contact Storage Server");
+                continue;
+            }
+
+            // Receive SS response and proxy it back to the client
+            MsgHeader ss_resp;
+            if (!recv_all(ss_sock, &ss_resp, sizeof(ss_resp))) {
+                send_error(socket, 502, "No response from Storage Server");
+                continue;
+            }
+
+            // Send header to client
+            if (!send_all(socket, &ss_resp, sizeof(ss_resp))) {
+                // Client disconnected
+                continue;
+            }
+
+            // Forward payload in full (if any)
+            size_t remaining = ss_resp.payload_size;
+            char buf[4096];
+            while (remaining > 0) {
+                size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+                if (!recv_all(ss_sock, buf, chunk)) {
+                    send_error(socket, 502, "Failed to read SS payload");
+                    break;
+                }
+                if (!send_all(socket, buf, chunk)) {
+                    break;
+                }
+                remaining -= chunk;
+            }
+            continue;
+        }
+
         // TODO: handle other client commands...
     }
     
@@ -470,9 +532,13 @@ static void registry_add_file_if_absent(const char* filename, const char* owner)
 
 // Query all connected SS for their file lists and rebuild the registry (union)
 static void registry_refresh_from_ss(void) {
-    // Collect union into a simple local array (avoid dynamic alloc for MVP)
-    char union_list[32768];
-    size_t upos = 0, ucap = sizeof(union_list);
+    // Collect union into a dynamic buffer to avoid large stack usage
+    size_t ucap = 32768;
+    char* union_list = (char*)calloc(ucap, 1);
+    if (!union_list) {
+        return;
+    }
+    size_t upos = 0;
 
     pthread_mutex_lock(&connections_mutex);
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
@@ -525,8 +591,9 @@ static void registry_refresh_from_ss(void) {
     // Rebuild registry from union_list (dedupe by filename)
     // We'll scan union_list line by line and add unique names
     char* cursor = union_list;
-    // Build a temp array to dedupe
-    char names[2048][MAX_FILENAME_LEN];
+    // Build a temp array to dedupe (heap-allocated to avoid stack overflow)
+    int names_cap = 2048;
+    char (*names)[MAX_FILENAME_LEN] = calloc((size_t)names_cap, MAX_FILENAME_LEN);
     int ncount = 0;
 
     while (cursor && *cursor) {
@@ -541,7 +608,7 @@ static void registry_refresh_from_ss(void) {
             for (int k = 0; k < ncount; k++) {
                 if (strncmp(names[k], tmp, MAX_FILENAME_LEN) == 0) { found = 1; break; }
             }
-            if (!found && ncount < 2048) {
+            if (!found && ncount < names_cap) {
                 strncpy(names[ncount], tmp, MAX_FILENAME_LEN - 1);
                 names[ncount][MAX_FILENAME_LEN - 1] = '\0';
                 ncount++;
@@ -561,4 +628,7 @@ static void registry_refresh_from_ss(void) {
         file_count++;
     }
     pthread_mutex_unlock(&file_registry_mutex);
+
+    free(names);
+    free(union_list);
 }

@@ -6,51 +6,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <poll.h>
 
 int nm_socket;
 char username[MAX_USERNAME_LEN];
-// Watchdog: exit immediately if NM socket is closed (no need to wait for next command)
-static void* nm_disconnect_watchdog(void* arg) {
-    (void)arg;
-    struct pollfd pfd;
-    pfd.fd = nm_socket;
-    pfd.events = POLLIN | POLLERR | POLLHUP;
-#ifdef POLLRDHUP
-    pfd.events |= POLLRDHUP;
-#endif
-    while (1) {
-        int rc = poll(&pfd, 1, -1); // block until event
-        if (rc > 0) {
-            if (pfd.revents & (POLLERR | POLLHUP
-#ifdef POLLRDHUP
-                               | POLLRDHUP
-#endif
-                               )) {
-                fprintf(stderr, "\n[Client] Name Server disconnected. Exiting.\n");
-                // Best-effort flush
-                fflush(stdout);
-                _exit(1);
-            }
-            if (pfd.revents & POLLIN) {
-                // Something to read: check if it's a disconnect (read returns 0)
-                char tmp;
-                ssize_t n = recv(nm_socket, &tmp, 1, MSG_PEEK);
-                if (n == 0) {
-                    fprintf(stderr, "\n[Client] Name Server disconnected. Exiting.\n");
-                    fflush(stdout);
-                    _exit(1);
-                }
-                // else data is available; let main thread handle it
-            }
-        } else if (rc < 0) {
-            // Poll failed; treat as fatal to avoid inconsistent state
-            perror("poll");
-            _exit(1);
-        }
-    }
-    return NULL;
-}
 
 /**
  * @brief Thread to listen for responses/updates from the Name Server
@@ -139,13 +97,12 @@ int main() {
         return 1;
     }
 
-    // --- Start watchdog to exit immediately if NM disconnects ---
-    pthread_t watchdog_id;
-    if (pthread_create(&watchdog_id, NULL, nm_disconnect_watchdog, NULL) != 0) {
-        perror("[Client] Failed to start NM watchdog");
-        return 1;
-    }
-    pthread_detach(watchdog_id);
+    // --- Start Thread to Listen for NM Messages ---
+    // (We won't use this yet, but it's good to have)
+    // pthread_t nm_thread_id;
+    // if(pthread_create(&nm_thread_id, NULL, listen_to_nm, NULL) != 0) {
+    //     perror("[Client] Failed to create NM listener thread");
+    // }
 
     // --- MAIN REPL (Read-Eval-Print Loop) ---
     char line[1024];
@@ -186,15 +143,15 @@ int main() {
 
             if (!send_all(nm_socket, &h, sizeof(h)) ||
                 !send_all(nm_socket, &payload, sizeof(payload))) {
-                fprintf(stderr, "[Client] Failed to send CREATE to NM (disconnected). Exiting.\n");
-                break;
+                fprintf(stderr, "[Client] Failed to send CREATE to NM.\n");
+                continue;
             }
 
             // Wait for NM response
             MsgHeader rh;
             if (!recv_all(nm_socket, &rh, sizeof(rh))) {
-                fprintf(stderr, "[Client] NM disconnected. Exiting.\n");
-                break;
+                fprintf(stderr, "[Client] No response from NM.\n");
+                continue;
             }
 
             if (rh.command == CMD_ACK) {
@@ -210,31 +167,73 @@ int main() {
             } else {
                 printf("[Client] Unexpected response (%d).\n", rh.command);
             }
-        } else if (strcmp(command, "VIEW") == 0) {
-            // Send VIEW request to NM (no payload)
-            MsgHeader h = {0};
-            h.command = CMD_VIEW_FILES;
-            h.payload_size = 0;
-
-            if (!send_all(nm_socket, &h, sizeof(h))) {
-                fprintf(stderr, "[Client] Failed to send VIEW to NM (disconnected). Exiting.\n");
-                break;
+        } else if (strcmp(command, "DELETE") == 0) {
+            char* fname = strtok(NULL, " ");
+            if (!fname) {
+                printf("[Client] Usage: DELETE <filename>\n");
+                continue;
             }
 
-            // Await response
+            MsgHeader h = {0};
+            MsgDeleteFile payload = {0};
+            h.command = CMD_DELETE_FILE;
+            h.payload_size = sizeof(MsgDeleteFile);
+            strncpy(payload.filename, fname, MAX_FILENAME_LEN - 1);
+
+            if (!send_all(nm_socket, &h, sizeof(h)) ||
+                !send_all(nm_socket, &payload, sizeof(payload))) {
+                fprintf(stderr, "[Client] Failed to send DELETE to NM.\n");
+                continue;
+            }
+
+            // Wait for NM response
             MsgHeader rh;
             if (!recv_all(nm_socket, &rh, sizeof(rh))) {
-                fprintf(stderr, "[Client] NM disconnected. Exiting.\n");
-                break;
+                fprintf(stderr, "[Client] No response from NM.\n");
+                continue;
+            }
+
+            if (rh.command == CMD_ACK) {
+                printf("[Client] File '%s' deleted.\n", fname);
+            } else if (rh.command == CMD_ERROR) {
+                MsgError err = {0};
+                if (rh.payload_size == sizeof(MsgError) &&
+                    recv_all(nm_socket, &err, sizeof(err))) {
+                    printf("[Client] DELETE failed (%d): %s\n", err.code, err.message);
+                } else {
+                    printf("[Client] DELETE failed (unknown error).\n");
+                }
+            } else {
+                printf("[Client] Unexpected response (%d).\n", rh.command);
+            }
+        } else if (strcmp(command, "VIEW") == 0) {
+            // Request a view of all files from NM
+            MsgHeader h = {0};
+            h.command = CMD_VIEW_FILES;
+            h.payload_size = 0; // no payload
+
+            if (!send_all(nm_socket, &h, sizeof(h))) {
+                fprintf(stderr, "[Client] Failed to send VIEW to NM.\n");
+                continue;
+            }
+
+            // Wait for NM response
+            MsgHeader rh;
+            if (!recv_all(nm_socket, &rh, sizeof(rh))) {
+                fprintf(stderr, "[Client] No response from NM.\n");
+                continue;
             }
 
             if (rh.command == CMD_VIEW_FILES_RESP && rh.payload_size == sizeof(MsgViewFilesResponse)) {
                 MsgViewFilesResponse resp = {0};
-                if (recv_all(nm_socket, &resp, sizeof(resp))) {
-                    // Print list (may be empty)
-                    printf("%s", resp.file_list);
+                if (!recv_all(nm_socket, &resp, sizeof(resp))) {
+                    fprintf(stderr, "[Client] Failed to read VIEW payload.\n");
+                    continue;
+                }
+                if (resp.file_list[0] == '\0') {
+                    printf("[Client] No files available.\n");
                 } else {
-                    printf("[Client] VIEW failed: payload read error.\n");
+                    printf("%s", resp.file_list);
                 }
             } else if (rh.command == CMD_ERROR) {
                 MsgError err = {0};
@@ -244,7 +243,7 @@ int main() {
                     printf("[Client] VIEW failed (unknown error).\n");
                 }
             } else {
-                // Drain any payload if present
+                // Drain any unexpected payload
                 size_t remaining = rh.payload_size;
                 char drain[512];
                 while (remaining > 0) {
@@ -255,7 +254,6 @@ int main() {
                 printf("[Client] Unexpected response (%d).\n", rh.command);
             }
         } else if (strcmp(command, "READ") == 0) {
-            // Not implemented yet
             printf("[Client] Command '%s' not implemented yet.\n", command);
         } else {
             printf("[Client] Unknown command: %s\n", command);

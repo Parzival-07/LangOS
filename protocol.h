@@ -27,14 +27,16 @@ typedef enum {
 
     // File operations
     CMD_CREATE_FILE = 300,
+    CMD_DELETE_FILE = 301,
 
-    // View operations (Client <-> NM)
-    CMD_VIEW_FILES = 310,        // Client -> NM (request)
-    CMD_VIEW_FILES_RESP = 311    // NM -> Client (response)
-    ,
-    // NM <-> SS synchronization
-    CMD_SS_LIST_FILES = 320,       // NM -> SS (request)
-    CMD_SS_LIST_FILES_RESP = 321   // SS -> NM (response)
+    // View/listing operations
+    // Client <-> NM
+    CMD_VIEW_FILES = 310,
+    CMD_VIEW_FILES_RESP = 311,
+
+    // NM <-> SS (internal listing used by NM to refresh registry)
+    CMD_SS_LIST_FILES = 320,
+    CMD_SS_LIST_FILES_RESP = 321
 } CommandCode;
 
 // --- DATA STRUCTURES ---
@@ -72,18 +74,22 @@ typedef struct {
     char owner[MAX_USERNAME_LEN];
 } MsgCreateFile;
 
-// Data for VIEW response
-// NM -> Client
-// Contains a newline-separated list of filenames the NM knows about
-// Note: MVP fixed buffer; truncate if larger
+// Data for CMD_DELETE_FILE
+// Client -> NM -> SS
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+} MsgDeleteFile;
+
+// Data for CMD_VIEW_FILES_RESP
+// NM -> Client: newline-separated list of filenames
 typedef struct {
     char file_list[16384];
 } MsgViewFilesResponse;
 
-// Data for SS file listing response
-// SS -> NM
+// Data for CMD_SS_LIST_FILES_RESP
+// SS -> NM: newline-separated list of filenames on that SS
 typedef struct {
-    char files[16384]; // newline-separated content filenames (exclude .meta)
+    char files[16384];
 } MsgSSFileListResponse;
 
 
