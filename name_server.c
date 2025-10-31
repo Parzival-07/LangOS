@@ -44,6 +44,17 @@ typedef struct {
 ConnectionInfo connections[MAX_CONNECTIONS];
 pthread_mutex_t connections_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// --- FILE REGISTRY (maintained by NM) ---
+#define MAX_FILES 10000
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+    char owner[MAX_USERNAME_LEN];
+} FileRecord;
+
+static FileRecord file_registry[MAX_FILES];
+static int file_count = 0;
+static pthread_mutex_t file_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // --- PROTOTYPES ---
 void* handle_connection(void* arg);
 void handle_register_ss(int slot, const MsgRegisterSS* msg);
@@ -52,6 +63,7 @@ void send_ack(int socket);
 // Forward declarations for helpers used in handle_connection
 static int choose_ss_slot(void);
 static void send_error(int socket, int code, const char* msg);
+static void registry_add_file_if_absent(const char* filename, const char* owner);
 
 // --- MAIN SERVER LOGIC ---
 
@@ -274,6 +286,11 @@ void* handle_connection(void* arg) {
                 continue;
             }
 
+            // If SS acknowledged creation, update NM registry before proxying
+            if (ss_resp.command == CMD_ACK) {
+                registry_add_file_if_absent(payload.filename, payload.owner);
+            }
+
             // Send header to client
             if (!send_all(socket, &ss_resp, sizeof(ss_resp))) {
                 // Client disconnected
@@ -293,6 +310,48 @@ void* handle_connection(void* arg) {
                     break;
                 }
                 remaining -= chunk;
+            }
+            continue;
+        } else if (header.command == CMD_VIEW_FILES && connections[slot].type == CONN_TYPE_CLIENT) {
+            // No payload expected for simple VIEW
+            if (header.payload_size != 0) {
+                // Drain any unexpected payload
+                char drain[1024];
+                size_t remaining = header.payload_size;
+                while (remaining > 0) {
+                    size_t chunk = remaining > sizeof(drain) ? sizeof(drain) : remaining;
+                    if (!recv_all(socket, drain, chunk)) break;
+                    remaining -= chunk;
+                }
+            }
+
+            // Build newline-separated list
+            char buffer[16384];
+            buffer[0] = '\0';
+            size_t pos = 0, cap = sizeof(buffer);
+
+            pthread_mutex_lock(&file_registry_mutex);
+            for (int i = 0; i < file_count; i++) {
+                int n = snprintf(buffer + pos, (pos < cap ? cap - pos : 0), "%s\n", file_registry[i].filename);
+                if (n <= 0) break;
+                if ((size_t)n >= (cap - pos)) { // truncated; stop
+                    pos = cap - 1;
+                    break;
+                }
+                pos += (size_t)n;
+            }
+            pthread_mutex_unlock(&file_registry_mutex);
+
+            MsgViewFilesResponse resp = {0};
+            strncpy(resp.file_list, buffer, sizeof(resp.file_list) - 1);
+
+            MsgHeader h = {0};
+            h.command = CMD_VIEW_FILES_RESP;
+            h.payload_size = sizeof(MsgViewFilesResponse);
+
+            if (!send_all(socket, &h, sizeof(h)) ||
+                !send_all(socket, &resp, sizeof(resp))) {
+                // Client disconnected
             }
             continue;
         }
@@ -387,4 +446,21 @@ static void send_error(int socket, int code, const char* msg) {
     strncpy(e.message, msg ? msg : "error", sizeof(e.message)-1);
     send_all(socket, &h, sizeof(h));
     send_all(socket, &e, sizeof(e));
+}
+
+static void registry_add_file_if_absent(const char* filename, const char* owner) {
+    if (!filename || !*filename) return;
+    pthread_mutex_lock(&file_registry_mutex);
+    for (int i = 0; i < file_count; i++) {
+        if (strncmp(file_registry[i].filename, filename, MAX_FILENAME_LEN) == 0) {
+            pthread_mutex_unlock(&file_registry_mutex);
+            return; // already present
+        }
+    }
+    if (file_count < MAX_FILES) {
+        strncpy(file_registry[file_count].filename, filename, MAX_FILENAME_LEN - 1);
+        if (owner) strncpy(file_registry[file_count].owner, owner, MAX_USERNAME_LEN - 1);
+        file_count++;
+    }
+    pthread_mutex_unlock(&file_registry_mutex);
 }
