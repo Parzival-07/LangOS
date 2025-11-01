@@ -43,14 +43,20 @@ typedef enum {
     // Client <-> NM
     CMD_READ_FILE = 330,
     CMD_READ_FILE_RESP = 331,
-
+    
     // Access control operations
     CMD_ADD_ACCESS = 340,
     CMD_REM_ACCESS = 341,
 
     // File info query
     CMD_INFO = 350,
-    CMD_INFO_RESP = 351
+    CMD_INFO_RESP = 351,
+
+    // Direct client -> SS write (session begin)
+    CMD_WRITE_BEGIN = 360,
+    // Direct client -> SS write (apply and finalize)
+    CMD_WRITE_FILE = 361,
+    CMD_WRITE_DONE = 362
 } CommandCode;
 
 // --- DATA STRUCTURES ---
@@ -141,6 +147,27 @@ typedef struct {
 typedef struct {
     char info[2048];
 } MsgInfoResponse;
+ 
+// Data for CMD_WRITE_BEGIN (direct client -> SS): acquire a sentence lock only
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+    int  sentence_index;       // 0-based
+} MsgWriteBegin;
+
+// Data for CMD_WRITE_FILE (direct client -> SS)
+// Replace a specific sentence (0-based index) in the file with replacement text
+// NOTE: Sentence-parsing/locking is handled on SS side. For MVP we enforce a max replacement size.
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+    int  sentence_index;       // 0-based
+    char replacement[2048];    // new sentence text (UTF-8)
+} MsgWriteFile;
+
+// Data for CMD_WRITE_DONE (client -> SS): release a previously acquired sentence lock
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+    int sentence_index;        // 0-based
+} MsgWriteDone;
 
 
 // --- HELPER FUNCTIONS ---

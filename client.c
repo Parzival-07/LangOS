@@ -5,7 +5,6 @@
 #include <pthread.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <poll.h>
@@ -52,28 +51,7 @@ void* nm_watchdog(void* arg) {
     return NULL;
 }
 
-/**
- * @brief Thread to listen for responses/updates from the Name Server
- */
-void* listen_to_nm(void* arg) {
-    MsgHeader header;
-    
-    // Loop forever, waiting for responses from the NM
-    while (true) {
-        if (!recv_all(nm_socket, &header, sizeof(MsgHeader))) {
-            fprintf(stderr, "\n[Client] Connection to Name Server lost! Exiting.\n");
-            exit(EXIT_FAILURE); // If NM is down, client can't function
-        }
-
-        printf("\n[Client] Received async command %d from Name Server.\n", header.command);
-        
-        // TODO: In the future, handle async updates
-        // For now, just print the prompt again
-        printf("%s> ", username);
-        fflush(stdout);
-    }
-    return NULL;
-}
+// Removed broken listen_to_nm placeholder from merge; NM interactions are synchronous in the REPL.
 
 // Helper function to remove trailing newline from fgets
 void remove_newline(char* str) {
@@ -297,6 +275,243 @@ int main() {
                 }
                 printf("[Client] Unexpected response (%d).\n", rh.command);
             }
+        } else if (strcmp(command, "WRITE") == 0) {
+            char* fname = strtok(NULL, " ");
+            char* sidx_s = strtok(NULL, " ");
+            if (!fname || !sidx_s) {
+                printf("[Client] Usage: WRITE <filename> <sentence_number>\n");
+                continue;
+            }
+            int sidx = atoi(sidx_s);
+            if (sidx < 0) { printf("[Client] Invalid sentence index.\n"); continue; }
+
+            // Resolve SS address for this file via NM (reuse READ routing)
+            MsgHeader h = (MsgHeader){0};
+            MsgReadFile req = (MsgReadFile){0};
+            h.command = CMD_READ_FILE;
+            h.payload_size = sizeof(req);
+            strncpy(req.filename, fname, MAX_FILENAME_LEN - 1);
+            if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &req, sizeof(req))) {
+                fprintf(stderr, "[Client] Failed to query NM for file location.\n");
+                continue;
+            }
+            MsgHeader rh;
+            if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] NM no response.\n"); continue; }
+            if (rh.command != CMD_READ_FILE_RESP || rh.payload_size != sizeof(MsgReadFileResponse)) {
+                // Drain
+                size_t rem = rh.payload_size; char drain[256];
+                while (rem > 0) { size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(nm_socket, drain, chunk)) break; rem -= chunk; }
+                printf("[Client] Unexpected NM response (%d).\n", rh.command);
+                continue;
+            }
+            MsgReadFileResponse addr = {0};
+            if (!recv_all(nm_socket, &addr, sizeof(addr))) { fprintf(stderr, "[Client] Failed reading location.\n"); continue; }
+            if (!addr.found) { printf("[Client] File not found.\n"); continue; }
+
+            // Connect to SS (header-based protocol)
+            int ss_fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (ss_fd < 0) { perror("[Client] socket"); continue; }
+            struct sockaddr_in ss_addr; memset(&ss_addr, 0, sizeof(ss_addr));
+            ss_addr.sin_family = AF_INET; ss_addr.sin_port = htons((uint16_t)addr.ss_port);
+            if (inet_pton(AF_INET, addr.ss_ip, &ss_addr.sin_addr) <= 0) { perror("[Client] inet_pton"); close(ss_fd); continue; }
+            if (connect(ss_fd, (struct sockaddr*)&ss_addr, sizeof(ss_addr)) < 0) { perror("[Client] connect SS"); close(ss_fd); continue; }
+
+            // Acquire lock: CMD_WRITE_BEGIN
+            MsgWriteBegin begin = (MsgWriteBegin){0}; strncpy(begin.filename, fname, MAX_FILENAME_LEN - 1); begin.sentence_index = sidx;
+            MsgHeader bh = { .command = CMD_WRITE_BEGIN, .payload_size = sizeof(begin) };
+            if (!send_all(ss_fd, &bh, sizeof(bh)) || !send_all(ss_fd, &begin, sizeof(begin))) { fprintf(stderr, "[Client] Failed to send WRITE_BEGIN.\n"); close(ss_fd); continue; }
+            MsgHeader brh; if (!recv_all(ss_fd, &brh, sizeof(brh))) { fprintf(stderr, "[Client] No response for WRITE_BEGIN.\n"); close(ss_fd); continue; }
+            if (brh.command == CMD_ERROR && brh.payload_size == sizeof(MsgError)) {
+                MsgError err; recv_all(ss_fd, &err, sizeof(err)); printf("[Client] WRITE_BEGIN failed (%d): %s\n", err.code, err.message); close(ss_fd); continue;
+            } else if (brh.command != CMD_ACK) {
+                // Drain
+                size_t rem = brh.payload_size; char drain[256]; while (rem > 0) { size_t chunk = rem > sizeof(drain)?sizeof(drain):rem; if (!recv_all(ss_fd, drain, chunk)) break; rem -= chunk; }
+                printf("[Client] Unexpected response to WRITE_BEGIN (%d).\n", brh.command); close(ss_fd); continue;
+            }
+
+            // Fetch file content via header-based READ to build the working sentence
+            MsgHeader rqh = { .command = CMD_READ_FILE, .payload_size = sizeof(MsgReadFile) };
+            if (!send_all(ss_fd, &rqh, sizeof(rqh)) || !send_all(ss_fd, &req, sizeof(req))) { fprintf(stderr, "[Client] Failed to request file from SS.\n"); close(ss_fd); continue; }
+            MsgHeader rrh; if (!recv_all(ss_fd, &rrh, sizeof(rrh))) { fprintf(stderr, "[Client] No READ response from SS.\n"); close(ss_fd); continue; }
+            if (rrh.command == CMD_ERROR && rrh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(ss_fd, &err, sizeof(err)); printf("[Client] READ failed (%d): %s\n", err.code, err.message); close(ss_fd); continue; }
+            if (rrh.command != CMD_ACK || rrh.payload_size < 0) { printf("[Client] Unexpected READ response (%d).\n", rrh.command); close(ss_fd); continue; }
+            int fsize = rrh.payload_size; char* filebuf = (char*)malloc((size_t)fsize + 1); if (!filebuf) { fprintf(stderr, "[Client] OOM.\n"); close(ss_fd); continue; }
+            if (fsize > 0 && !recv_all(ss_fd, filebuf, (size_t)fsize)) { fprintf(stderr, "[Client] Failed to receive file data.\n"); free(filebuf); close(ss_fd); continue; }
+            filebuf[fsize] = '\0';
+
+            // Parse sentences: split on .!? including trailing whitespace
+            // Locate target sentence string boundaries
+            int current = 0; size_t i = 0, n = (size_t)fsize; size_t s_begin = 0, s_end = 0; int found = 0;
+            while (i < n) {
+                size_t start = i;
+                while (i < n && filebuf[i] != '.' && filebuf[i] != '!' && filebuf[i] != '?') i++;
+                if (i < n && (filebuf[i] == '.' || filebuf[i] == '!' || filebuf[i] == '?')) {
+                    i++;
+                    while (i < n && (filebuf[i] == ' ' || filebuf[i] == '\n' || filebuf[i] == '\t' || filebuf[i] == '\r')) i++;
+                }
+                size_t end = i;
+                if (current == sidx) { s_begin = start; s_end = end; found = 1; break; }
+                current++;
+            }
+            // If not found but it's exactly at the end (append new sentence), allow editing empty sentence
+            if (!found && sidx == current) { s_begin = s_end = n; found = 1; }
+            if (!found) {
+                printf("[Client] Sentence %d not found.\n", sidx);
+                // release lock
+                MsgWriteDone done = (MsgWriteDone){0}; strncpy(done.filename, fname, MAX_FILENAME_LEN-1); done.sentence_index = sidx;
+                MsgHeader dh = { .command = CMD_WRITE_DONE, .payload_size = sizeof(done) };
+                send_all(ss_fd, &dh, sizeof(dh)); send_all(ss_fd, &done, sizeof(done));
+                free(filebuf); close(ss_fd);
+                continue;
+            }
+
+            // Extract sentence into working words
+            size_t slen = (s_end > s_begin ? (s_end - s_begin) : 0);
+            char* sentence = (char*)malloc(slen + 1);
+            if (!sentence) { fprintf(stderr, "[Client] OOM.\n"); free(filebuf); close(ss_fd); continue; }
+            memcpy(sentence, filebuf + s_begin, slen); sentence[slen] = '\0';
+            free(filebuf);
+
+            // Tokenize by spaces (simple)
+            char** words = NULL; int wcount = 0; size_t cap = 0;
+            char* tokbuf = strdup(sentence);
+            if (!tokbuf) { fprintf(stderr, "[Client] OOM.\n"); free(sentence); close(ss_fd); continue; }
+            char* saveptr = NULL; char* t = strtok_r(tokbuf, " \t\r\n", &saveptr);
+            while (t) {
+                if (wcount == (int)cap) { cap = cap ? cap*2 : 8; char** nw = realloc(words, cap * sizeof(char*)); if (!nw) { fprintf(stderr, "[Client] OOM.\n"); break; } words = nw; }
+                words[wcount++] = strdup(t);
+                t = strtok_r(NULL, " \t\r\n", &saveptr);
+            }
+            free(tokbuf);
+
+            // Show current sentence words (1-based)
+            if (wcount > 0) {
+                printf("[Client] Current sentence words (1-based):\n");
+                for (int iw = 0; iw < wcount; iw++) {
+                    printf("  %d: %s\n", iw+1, words[iw]);
+                }
+            } else {
+                printf("[Client] Current sentence is empty.\n");
+            }
+            printf("[Client] Enter '<word_index> <content>' (1-based). Use index (current_len+1) to append. Type 'ETIRW' to finish.\n");
+            while (1) {
+                printf("WRITE> "); fflush(stdout);
+                char wline[4096]; if (!fgets(wline, sizeof(wline), stdin)) { printf("\n[Client] Input ended.\n"); break; }
+                wline[strcspn(wline, "\n")] = 0;
+                if (strcmp(wline, "ETIRW") == 0) break;
+                // parse index and content
+                char* p = wline; while (*p==' ') p++;
+                if (!*p) continue;
+                char* endptr = NULL; long idx1 = strtol(p, &endptr, 10);
+                if (p == endptr) { printf("[Client] Expected '<index> <content>'.\n"); continue; }
+                while (*endptr==' ') endptr++;
+                char* content = endptr; if (!content) content = "";
+                if (idx1 <= 0 || idx1 > (long)wcount + 1) { printf("[Client] Index out of range (1..%d).\n", wcount + 1); continue; }
+                long idx = idx1 - 1; // convert to 0-based
+                if (idx == wcount) {
+                    // append
+                    if (wcount == (int)cap) { cap = cap ? cap*2 : 8; char** nw = realloc(words, cap * sizeof(char*)); if (!nw) { fprintf(stderr, "[Client] OOM.\n"); break; } words = nw; }
+                    words[wcount++] = strdup(content);
+                } else {
+                    // replace
+                    free(words[idx]); words[idx] = strdup(content);
+                }
+            }
+
+            // Build final sentence
+            size_t final_len = 0; for (int i = 0; i < wcount; i++) final_len += strlen(words[i]) + (i+1 < wcount ? 1 : 0);
+            char* final_sentence = (char*)malloc(final_len + 1); if (!final_sentence) { fprintf(stderr, "[Client] OOM.\n"); }
+            if (final_sentence) {
+                size_t pos = 0; for (int i = 0; i < wcount; i++) { size_t wl = strlen(words[i]); memcpy(final_sentence+pos, words[i], wl); pos += wl; if (i+1 < wcount) final_sentence[pos++] = ' '; }
+                final_sentence[pos] = '\0';
+            }
+
+            // Apply write
+            MsgWriteFile w = (MsgWriteFile){0}; strncpy(w.filename, fname, MAX_FILENAME_LEN - 1); w.sentence_index = sidx;
+            if (final_sentence) { strncpy(w.replacement, final_sentence, sizeof(w.replacement)-1); } else { w.replacement[0] = '\0'; }
+            MsgHeader wh = { .command = CMD_WRITE_FILE, .payload_size = sizeof(w) };
+            if (!send_all(ss_fd, &wh, sizeof(wh)) || !send_all(ss_fd, &w, sizeof(w))) { fprintf(stderr, "[Client] Failed to send WRITE.\n"); }
+            MsgHeader wr; if (!recv_all(ss_fd, &wr, sizeof(wr))) { fprintf(stderr, "[Client] No response to WRITE.\n"); }
+            if (wr.command == CMD_ERROR && wr.payload_size == sizeof(MsgError)) { MsgError err; recv_all(ss_fd, &err, sizeof(err)); printf("[Client] WRITE failed (%d): %s\n", err.code, err.message); }
+            else if (wr.command != CMD_ACK) { printf("[Client] Unexpected response to WRITE (%d).\n", wr.command); }
+            else { printf("[Client] WRITE applied.\n"); }
+
+            // Release lock
+            MsgWriteDone done = (MsgWriteDone){0}; strncpy(done.filename, fname, MAX_FILENAME_LEN - 1); done.sentence_index = sidx;
+            MsgHeader dh = { .command = CMD_WRITE_DONE, .payload_size = sizeof(done) };
+            send_all(ss_fd, &dh, sizeof(dh)); send_all(ss_fd, &done, sizeof(done));
+            MsgHeader drh; if (recv_all(ss_fd, &drh, sizeof(drh))) {
+                if (drh.command == CMD_ERROR && drh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(ss_fd, &err, sizeof(err)); printf("[Client] WRITE_DONE failed (%d): %s\n", err.code, err.message); }
+            }
+
+            // Cleanup
+            if (final_sentence) free(final_sentence);
+            for (int iw2 = 0; iw2 < wcount; iw2++) free(words[iw2]); if (words) free(words);
+            free(sentence);
+            close(ss_fd);
+        } else if (strcmp(command, "ADDACCESS") == 0) {
+            char* fname = strtok(NULL, " ");
+            char* target = strtok(NULL, " ");
+            char* mode = strtok(NULL, " "); // R or W
+            if (!fname || !target || !mode || !(mode[0]=='R' || mode[0]=='W')) {
+                printf("[Client] Usage: ADDACCESS <filename> <username> <R|W>\n");
+                continue;
+            }
+            MsgAccessChange ac = (MsgAccessChange){0};
+            strncpy(ac.filename, fname, MAX_FILENAME_LEN-1);
+            strncpy(ac.target, target, MAX_USERNAME_LEN-1);
+            strncpy(ac.requester, username, MAX_USERNAME_LEN-1);
+            ac.is_writer = (mode[0] == 'W');
+            MsgHeader h = { .command = CMD_ADD_ACCESS, .payload_size = sizeof(ac) };
+            if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &ac, sizeof(ac))) {
+                fprintf(stderr, "[Client] Failed to send ADDACCESS.\n");
+                continue;
+            }
+            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] NM disconnected.\n"); break; }
+            if (rh.command == CMD_ACK) printf("[Client] Access added.\n");
+            else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(nm_socket, &err, sizeof(err)); printf("[Client] ADDACCESS failed (%d): %s\n", err.code, err.message); }
+            else printf("[Client] Unexpected response (%d).\n", rh.command);
+        } else if (strcmp(command, "REMACCESS") == 0) {
+            char* fname = strtok(NULL, " ");
+            char* target = strtok(NULL, " ");
+            if (!fname || !target) {
+                printf("[Client] Usage: REMACCESS <filename> <username>\n");
+                continue;
+            }
+            MsgAccessChange ac = (MsgAccessChange){0};
+            strncpy(ac.filename, fname, MAX_FILENAME_LEN-1);
+            strncpy(ac.target, target, MAX_USERNAME_LEN-1);
+            strncpy(ac.requester, username, MAX_USERNAME_LEN-1);
+            ac.is_writer = 0; // ignored by server on removal
+            MsgHeader h = { .command = CMD_REM_ACCESS, .payload_size = sizeof(ac) };
+            if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &ac, sizeof(ac))) {
+                fprintf(stderr, "[Client] Failed to send REMACCESS.\n");
+                continue;
+            }
+            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] NM disconnected.\n"); break; }
+            if (rh.command == CMD_ACK) printf("[Client] Access removed.\n");
+            else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(nm_socket, &err, sizeof(err)); printf("[Client] REMACCESS failed (%d): %s\n", err.code, err.message); }
+            else printf("[Client] Unexpected response (%d).\n", rh.command);
+        } else if (strcmp(command, "INFO") == 0) {
+            char* fname = strtok(NULL, " ");
+            if (!fname) { printf("[Client] Usage: INFO <filename>\n"); continue; }
+            MsgInfoRequest rq = (MsgInfoRequest){0};
+            strncpy(rq.filename, fname, MAX_FILENAME_LEN-1);
+            MsgHeader h = { .command = CMD_INFO, .payload_size = sizeof(rq) };
+            if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &rq, sizeof(rq))) {
+                fprintf(stderr, "[Client] Failed to send INFO.\n");
+                continue;
+            }
+            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] NM disconnected.\n"); break; }
+            if (rh.command == CMD_INFO_RESP && rh.payload_size == sizeof(MsgInfoResponse)) {
+                MsgInfoResponse resp; if (recv_all(nm_socket, &resp, sizeof(resp))) { printf("%s\n", resp.info); }
+            } else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) {
+                MsgError err; recv_all(nm_socket, &err, sizeof(err)); printf("[Client] INFO failed (%d): %s\n", err.code, err.message);
+            } else {
+                // Drain unexpected
+                size_t rem = rh.payload_size; char drain[256]; while (rem > 0) { size_t chunk = rem > sizeof(drain)?sizeof(drain):rem; if (!recv_all(nm_socket, drain, chunk)) break; rem -= chunk; }
+                printf("[Client] Unexpected response (%d).\n", rh.command);
+            }
         } else if (strcmp(command, "READ") == 0) {
             char* fname = strtok(NULL, " ");
             if (!fname) {
@@ -369,56 +584,6 @@ int main() {
             // Ensure a trailing newline for cleanliness
             if (flen > 0) printf("\n");
             close(ss_fd);
-        } else if (strcmp(command, "ADDACCESS") == 0) {
-            // Usage: ADDACCESS <filename> <reader|writer> <username>
-            char* fname = strtok(NULL, " ");
-            char* role = strtok(NULL, " ");
-            char* user = strtok(NULL, " ");
-            if (!fname || !role || !user) {
-                printf("[Client] Usage: ADDACCESS <filename> <reader|writer> <username>\n");
-                continue;
-            }
-            MsgAccessChange msg = {0};
-            strncpy(msg.filename, fname, MAX_FILENAME_LEN - 1);
-            strncpy(msg.target, user, MAX_USERNAME_LEN - 1);
-            msg.is_writer = (strcasecmp(role, "writer") == 0) ? 1 : 0;
-            strncpy(msg.requester, username, MAX_USERNAME_LEN - 1);
-            MsgHeader h = { .command = CMD_ADD_ACCESS, .payload_size = sizeof(msg) };
-            if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &msg, sizeof(msg))) { fprintf(stderr, "[Client] Failed to send ADDACCESS to NM.\n"); continue; }
-            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] No response from NM.\n"); break; }
-            if (rh.command == CMD_ACK) { printf("[Client] Access added.\n"); }
-            else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError e; if (recv_all(nm_socket, &e, sizeof(e))) printf("[Client] ADDACCESS failed (%d): %s\n", e.code, e.message); }
-            else { // drain
-                size_t rem = rh.payload_size; char drain[256]; while (rem>0){ size_t c= rem>sizeof(drain)?sizeof(drain):rem; if(!recv_all(nm_socket, drain, c)) break; rem-=c; }
-                printf("[Client] Unexpected response (%d).\n", rh.command);
-            }
-        } else if (strcmp(command, "REMACCESS") == 0) {
-            // Usage: REMACCESS <filename> <reader|writer> <username>
-            char* fname = strtok(NULL, " ");
-            char* role = strtok(NULL, " ");
-            char* user = strtok(NULL, " ");
-            if (!fname || !role || !user) { printf("[Client] Usage: REMACCESS <filename> <reader|writer> <username>\n"); continue; }
-            MsgAccessChange msg = {0};
-            strncpy(msg.filename, fname, MAX_FILENAME_LEN - 1);
-            strncpy(msg.target, user, MAX_USERNAME_LEN - 1);
-            msg.is_writer = (strcasecmp(role, "writer") == 0) ? 1 : 0;
-            strncpy(msg.requester, username, MAX_USERNAME_LEN - 1);
-            MsgHeader h = { .command = CMD_REM_ACCESS, .payload_size = sizeof(msg) };
-            if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &msg, sizeof(msg))) { fprintf(stderr, "[Client] Failed to send REMACCESS to NM.\n"); continue; }
-            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] No response from NM.\n"); break; }
-            if (rh.command == CMD_ACK) { printf("[Client] Access removed.\n"); }
-            else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError e; if (recv_all(nm_socket, &e, sizeof(e))) printf("[Client] REMACCESS failed (%d): %s\n", e.code, e.message); }
-            else { size_t rem=rh.payload_size; char drain[256]; while(rem>0){ size_t c= rem>sizeof(drain)?sizeof(drain):rem; if(!recv_all(nm_socket, drain, c)) break; rem-=c;} printf("[Client] Unexpected response (%d).\n", rh.command);}           
-        } else if (strcmp(command, "INFO") == 0) {
-            char* fname = strtok(NULL, " ");
-            if (!fname) { printf("[Client] Usage: INFO <filename>\n"); continue; }
-            MsgInfoRequest req = {0}; strncpy(req.filename, fname, MAX_FILENAME_LEN - 1);
-            MsgHeader h = { .command = CMD_INFO, .payload_size = sizeof(req) };
-            if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &req, sizeof(req))) { fprintf(stderr, "[Client] Failed to send INFO to NM.\n"); continue; }
-            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] No response from NM.\n"); break; }
-            if (rh.command == CMD_INFO_RESP && rh.payload_size == sizeof(MsgInfoResponse)) { MsgInfoResponse resp={0}; if (!recv_all(nm_socket, &resp, sizeof(resp))) { fprintf(stderr, "[Client] Failed to read INFO payload.\n"); break; } printf("%s", resp.info); }
-            else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError e; if (recv_all(nm_socket, &e, sizeof(e))) printf("[Client] INFO failed (%d): %s\n", e.code, e.message); }
-            else { size_t rem=rh.payload_size; char drain[256]; while(rem>0){ size_t c= rem>sizeof(drain)?sizeof(drain):rem; if(!recv_all(nm_socket, drain, c)) break; rem-=c;} printf("[Client] Unexpected response (%d).\n", rh.command);} 
         } else {
             printf("[Client] Unknown command: %s\n", command);
         }
