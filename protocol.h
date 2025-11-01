@@ -42,7 +42,15 @@ typedef enum {
     // READ routing and response
     // Client <-> NM
     CMD_READ_FILE = 330,
-    CMD_READ_FILE_RESP = 331
+    CMD_READ_FILE_RESP = 331,
+
+    // Access control operations
+    CMD_ADD_ACCESS = 340,
+    CMD_REM_ACCESS = 341,
+
+    // File info query
+    CMD_INFO = 350,
+    CMD_INFO_RESP = 351
 } CommandCode;
 
 // --- DATA STRUCTURES ---
@@ -111,6 +119,28 @@ typedef struct {
     char ss_ip[MAX_IP_LEN];    // IPv4 string (e.g., "127.0.0.1")
     int ss_port;               // SS client listen port
 } MsgReadFileResponse;
+
+// Data for CMD_ADD_ACCESS / CMD_REM_ACCESS
+// Client -> NM -> SS
+// is_writer: 0 means reader, 1 means writer
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+    char target[MAX_USERNAME_LEN];
+    int  is_writer;
+    char requester[MAX_USERNAME_LEN]; // NM will overwrite with authenticated username
+} MsgAccessChange;
+
+// Data for CMD_INFO
+// Client -> NM -> SS
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+} MsgInfoRequest;
+
+// Data for CMD_INFO_RESP
+// SS -> NM -> Client
+typedef struct {
+    char info[2048];
+} MsgInfoResponse;
 
 
 // --- HELPER FUNCTIONS ---
