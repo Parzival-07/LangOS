@@ -155,10 +155,42 @@ void* handle_client_connections(void* arg) {
         }
         printf("[SS] Received a direct client connection!\n");
         
-        // TODO: In Phase 2, create a new thread to handle this client
-        // for READ/WRITE operations.
-        // For now, just close it.
-        
+        // Simple protocol: client sends a single line with the filename, we return file content and close.
+        char fname[MAX_FILENAME_LEN+2];
+        size_t fpos = 0;
+        while (fpos < sizeof(fname)-1) {
+            char ch;
+            ssize_t r = recv(client_socket, &ch, 1, 0);
+            if (r <= 0) break; // disconnect or error
+            if (ch == '\n') break;
+            fname[fpos++] = ch;
+        }
+        fname[fpos] = '\0';
+
+        if (fpos == 0 || !is_valid_filename(fname)) {
+            const char* msg = "ERROR: invalid filename\n";
+            send_all(client_socket, msg, strlen(msg));
+            close(client_socket);
+            continue;
+        }
+
+        char path[512];
+        snprintf(path, sizeof(path), STORAGE_ROOT "/%s", fname);
+        FILE* f = fopen(path, "rb");
+        if (!f) {
+            const char* msg = "ERROR: not found\n";
+            send_all(client_socket, msg, strlen(msg));
+            close(client_socket);
+            continue;
+        }
+        char buf[4096];
+        size_t nread;
+        while ((nread = fread(buf, 1, sizeof(buf), f)) > 0) {
+            if (!send_all(client_socket, buf, nread)) {
+                break;
+            }
+        }
+        fclose(f);
         close(client_socket);
     }
     return NULL;

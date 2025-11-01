@@ -49,6 +49,7 @@ pthread_mutex_t connections_mutex = PTHREAD_MUTEX_INITIALIZER;
 typedef struct {
     char filename[MAX_FILENAME_LEN];
     char owner[MAX_USERNAME_LEN];
+    int ss_slot; // which storage server holds this file
 } FileRecord;
 
 static FileRecord file_registry[MAX_FILES];
@@ -63,7 +64,7 @@ void send_ack(int socket);
 // Forward declarations for helpers used in handle_connection
 static int choose_ss_slot(void);
 static void send_error(int socket, int code, const char* msg);
-static void registry_add_file_if_absent(const char* filename, const char* owner);
+static void registry_add_file_if_absent(const char* filename, const char* owner, int ss_slot);
 static void registry_refresh_from_ss(void);
 
 // --- MAIN SERVER LOGIC ---
@@ -289,7 +290,7 @@ void* handle_connection(void* arg) {
 
             // If SS acknowledged creation, update NM registry before proxying
             if (ss_resp.command == CMD_ACK) {
-                registry_add_file_if_absent(payload.filename, payload.owner);
+                registry_add_file_if_absent(payload.filename, payload.owner, ss_slot);
             }
 
             // Send header to client
@@ -356,6 +357,49 @@ void* handle_connection(void* arg) {
                 !send_all(socket, &resp, sizeof(resp))) {
                 // Client disconnected
             }
+            continue;
+        } else if (header.command == CMD_READ_FILE && connections[slot].type == CONN_TYPE_CLIENT) {
+            if (header.payload_size != sizeof(MsgReadFile)) {
+                send_error(socket, 400, "Bad payload size");
+                // Drain unexpected payload if any
+                size_t rem = header.payload_size; char drain[256];
+                while (rem > 0) { size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(socket, drain, chunk)) break; rem -= chunk; }
+                continue;
+            }
+            MsgReadFile req;
+            if (!recv_all(socket, &req, sizeof(req))) {
+                send_error(socket, 400, "Payload read failed");
+                continue;
+            }
+
+            // Ensure mapping is up-to-date
+            registry_refresh_from_ss();
+
+            MsgReadFileResponse resp = {0};
+            resp.found = 0;
+
+            pthread_mutex_lock(&file_registry_mutex);
+            int idx = -1;
+            for (int i = 0; i < file_count; i++) {
+                if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { idx = i; break; }
+            }
+            if (idx >= 0) {
+                int ss_slot = file_registry[idx].ss_slot;
+                pthread_mutex_lock(&connections_mutex);
+                if (ss_slot >= 0 && ss_slot < MAX_CONNECTIONS && connections[ss_slot].type == CONN_TYPE_SS && connections[ss_slot].socket >= 0) {
+                    resp.found = 1;
+                    strncpy(resp.ss_ip, connections[ss_slot].ip_addr, MAX_IP_LEN - 1);
+                    resp.ss_port = connections[ss_slot].client_port;
+                }
+                pthread_mutex_unlock(&connections_mutex);
+            }
+            pthread_mutex_unlock(&file_registry_mutex);
+
+            MsgHeader h = {0};
+            h.command = CMD_READ_FILE_RESP;
+            h.payload_size = sizeof(resp);
+            send_all(socket, &h, sizeof(h));
+            send_all(socket, &resp, sizeof(resp));
             continue;
         }
 
@@ -513,11 +557,14 @@ static void send_error(int socket, int code, const char* msg) {
     send_all(socket, &e, sizeof(e));
 }
 
-static void registry_add_file_if_absent(const char* filename, const char* owner) {
+static void registry_add_file_if_absent(const char* filename, const char* owner, int ss_slot) {
     if (!filename || !*filename) return;
     pthread_mutex_lock(&file_registry_mutex);
     for (int i = 0; i < file_count; i++) {
         if (strncmp(file_registry[i].filename, filename, MAX_FILENAME_LEN) == 0) {
+            if (file_registry[i].ss_slot < 0 && ss_slot >= 0) {
+                file_registry[i].ss_slot = ss_slot;
+            }
             pthread_mutex_unlock(&file_registry_mutex);
             return; // already present
         }
@@ -525,6 +572,7 @@ static void registry_add_file_if_absent(const char* filename, const char* owner)
     if (file_count < MAX_FILES) {
         strncpy(file_registry[file_count].filename, filename, MAX_FILENAME_LEN - 1);
         if (owner) strncpy(file_registry[file_count].owner, owner, MAX_USERNAME_LEN - 1);
+        file_registry[file_count].ss_slot = ss_slot;
         file_count++;
     }
     pthread_mutex_unlock(&file_registry_mutex);
@@ -532,13 +580,11 @@ static void registry_add_file_if_absent(const char* filename, const char* owner)
 
 // Query all connected SS for their file lists and rebuild the registry (union)
 static void registry_refresh_from_ss(void) {
-    // Collect union into a dynamic buffer to avoid large stack usage
-    size_t ucap = 32768;
-    char* union_list = (char*)calloc(ucap, 1);
-    if (!union_list) {
-        return;
-    }
-    size_t upos = 0;
+    // Build a new mapping from filenames to ss_slot
+    int names_cap = 2048;
+    char (*names)[MAX_FILENAME_LEN] = calloc((size_t)names_cap, MAX_FILENAME_LEN);
+    int* slots = calloc((size_t)names_cap, sizeof(int));
+    int ncount = 0;
 
     pthread_mutex_lock(&connections_mutex);
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
@@ -576,59 +622,42 @@ static void registry_refresh_from_ss(void) {
             continue;
         }
 
-        // Append to union_list (will dedupe later)
-        size_t len = strnlen(pl.files, sizeof(pl.files));
-        if (len == 0) continue;
-        if (upos + len >= ucap) len = ucap - upos - 1;
-        if (len > 0) {
-            memcpy(union_list + upos, pl.files, len);
-            upos += len;
-            union_list[upos] = '\0';
+        // Parse newline-separated filenames, dedupe, and store mapping to this SS slot
+        char* p = pl.files;
+        while (p && *p) {
+            char* nl = strchr(p, '\n');
+            size_t l = nl ? (size_t)(nl - p) : strlen(p);
+            if (l > 0 && l < MAX_FILENAME_LEN) {
+                char tmp[MAX_FILENAME_LEN];
+                memcpy(tmp, p, l); tmp[l] = '\0';
+                int exists = 0;
+                for (int k = 0; k < ncount; k++) {
+                    if (strncmp(names[k], tmp, MAX_FILENAME_LEN) == 0) { exists = 1; break; }
+                }
+                if (!exists && ncount < names_cap) {
+                    strncpy(names[ncount], tmp, MAX_FILENAME_LEN - 1);
+                    names[ncount][MAX_FILENAME_LEN - 1] = '\0';
+                    slots[ncount] = i;
+                    ncount++;
+                }
+            }
+            if (!nl) break; else p = nl + 1;
         }
     }
     pthread_mutex_unlock(&connections_mutex);
 
-    // Rebuild registry from union_list (dedupe by filename)
-    // We'll scan union_list line by line and add unique names
-    char* cursor = union_list;
-    // Build a temp array to dedupe (heap-allocated to avoid stack overflow)
-    int names_cap = 2048;
-    char (*names)[MAX_FILENAME_LEN] = calloc((size_t)names_cap, MAX_FILENAME_LEN);
-    int ncount = 0;
-
-    while (cursor && *cursor) {
-        char* nl = strchr(cursor, '\n');
-        size_t l = nl ? (size_t)(nl - cursor) : strlen(cursor);
-        if (l > 0 && l < MAX_FILENAME_LEN) {
-            char tmp[MAX_FILENAME_LEN];
-            memcpy(tmp, cursor, l);
-            tmp[l] = '\0';
-            // dedupe
-            int found = 0;
-            for (int k = 0; k < ncount; k++) {
-                if (strncmp(names[k], tmp, MAX_FILENAME_LEN) == 0) { found = 1; break; }
-            }
-            if (!found && ncount < names_cap) {
-                strncpy(names[ncount], tmp, MAX_FILENAME_LEN - 1);
-                names[ncount][MAX_FILENAME_LEN - 1] = '\0';
-                ncount++;
-            }
-        }
-        if (!nl) break;
-        cursor = nl + 1;
-    }
-
-    // Merge into registry: we’ll replace existing registry with the union
+    // Replace registry with the new mapping
     pthread_mutex_lock(&file_registry_mutex);
     file_count = 0;
     for (int i = 0; i < ncount && i < MAX_FILES; i++) {
         strncpy(file_registry[file_count].filename, names[i], MAX_FILENAME_LEN - 1);
         file_registry[file_count].filename[MAX_FILENAME_LEN - 1] = '\0';
-        file_registry[file_count].owner[0] = '\0'; // owner unknown after refresh
+        file_registry[file_count].owner[0] = '\0';
+        file_registry[file_count].ss_slot = slots[i];
         file_count++;
     }
     pthread_mutex_unlock(&file_registry_mutex);
 
     free(names);
-    free(union_list);
+    free(slots);
 }
