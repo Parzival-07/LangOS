@@ -78,6 +78,88 @@ int nm_socket;
 #define STORAGE_ROOT "ss_data"
 #endif
 
+// --- WRITE Sentence Lock State ---
+// Simple lock table for (filename, sentence_index) protected by a mutex.
+// Start simple: immediate fail if already locked; no waiting/queuing.
+
+#define MAX_SENTENCE_LOCKS 2048
+
+typedef struct {
+    int in_use;
+    char filename[MAX_FILENAME_LEN];
+    int sentence_index; // 0-based
+    int owner_fd;       // owning client socket
+} SentenceLock;
+
+static SentenceLock g_sentence_locks[MAX_SENTENCE_LOCKS];
+static pthread_mutex_t g_sentence_locks_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int sentence_lock_find(const char* filename, int idx) {
+    for (int i = 0; i < MAX_SENTENCE_LOCKS; i++) {
+        if (g_sentence_locks[i].in_use &&
+            g_sentence_locks[i].sentence_index == idx &&
+            strncmp(g_sentence_locks[i].filename, filename, MAX_FILENAME_LEN) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int sentence_lock_acquire_nowait_owner(const char* filename, int idx, int owner_fd) {
+    if (!filename || idx < 0) return -1;
+    pthread_mutex_lock(&g_sentence_locks_mutex);
+    // Already locked?
+    if (sentence_lock_find(filename, idx) >= 0) {
+        pthread_mutex_unlock(&g_sentence_locks_mutex);
+        return -1;
+    }
+    // Find free slot
+    for (int i = 0; i < MAX_SENTENCE_LOCKS; i++) {
+        if (!g_sentence_locks[i].in_use) {
+            g_sentence_locks[i].in_use = 1;
+            strncpy(g_sentence_locks[i].filename, filename, MAX_FILENAME_LEN - 1);
+            g_sentence_locks[i].filename[MAX_FILENAME_LEN - 1] = '\0';
+            g_sentence_locks[i].sentence_index = idx;
+            g_sentence_locks[i].owner_fd = owner_fd;
+            pthread_mutex_unlock(&g_sentence_locks_mutex);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&g_sentence_locks_mutex);
+    return -1; // table full
+}
+
+static int sentence_lock_owned_by(const char* filename, int idx, int owner_fd) {
+    int pos = sentence_lock_find(filename, idx);
+    if (pos < 0) return 0;
+    return g_sentence_locks[pos].owner_fd == owner_fd;
+}
+
+static void sentence_lock_release(const char* filename, int idx) {
+    pthread_mutex_lock(&g_sentence_locks_mutex);
+    int pos = sentence_lock_find(filename, idx);
+    if (pos >= 0) {
+        g_sentence_locks[pos].in_use = 0;
+        g_sentence_locks[pos].filename[0] = '\0';
+        g_sentence_locks[pos].sentence_index = 0;
+        g_sentence_locks[pos].owner_fd = -1;
+    }
+    pthread_mutex_unlock(&g_sentence_locks_mutex);
+}
+
+static void sentence_lock_release_all_for_owner(int owner_fd) {
+    pthread_mutex_lock(&g_sentence_locks_mutex);
+    for (int i = 0; i < MAX_SENTENCE_LOCKS; i++) {
+        if (g_sentence_locks[i].in_use && g_sentence_locks[i].owner_fd == owner_fd) {
+            g_sentence_locks[i].in_use = 0;
+            g_sentence_locks[i].filename[0] = '\0';
+            g_sentence_locks[i].sentence_index = 0;
+            g_sentence_locks[i].owner_fd = -1;
+        }
+    }
+    pthread_mutex_unlock(&g_sentence_locks_mutex);
+}
+
 static int ensure_dir(const char* path) {
     struct stat st;
     if (stat(path, &st) == 0) {
@@ -173,9 +255,360 @@ static int ss_delete_file_do(const char* filename) {
     return 0;
 }
 
+// Replace the sentence at index 'sidx' with 'repl' text in STORAGE_ROOT/filename.
+// Returns 0 on success, -1 on error with errbuf filled.
+static int parse_is_delim(char c) {
+    return (c == '.' || c == '!' || c == '?');
+}
+
+static int ss_write_replace_sentence_impl(const char* filepath, int sidx, const char* repl, char* errbuf, size_t errlen) {
+    // Read entire file
+    FILE* f = fopen(filepath, "rb");
+    if (!f) { snprintf(errbuf, errlen, "Open failed"); return -1; }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); snprintf(errbuf, errlen, "Seek failed"); return -1; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); snprintf(errbuf, errlen, "Tell failed"); return -1; }
+    rewind(f);
+    char* data = (char*)malloc((size_t)sz + 1);
+    if (!data) { fclose(f); snprintf(errbuf, errlen, "OOM"); return -1; }
+    size_t rd = fread(data, 1, (size_t)sz, f);
+    fclose(f);
+    data[rd] = '\0';
+
+    // Create tmp path
+    char tmppath[600];
+    snprintf(tmppath, sizeof(tmppath), "%s.tmp", filepath);
+    FILE* tf = fopen(tmppath, "wb");
+    if (!tf) { free(data); snprintf(errbuf, errlen, "Tmp open failed"); return -1; }
+
+    // Walk sentences
+    size_t i = 0, n = rd; int idx = 0; int replaced = 0;
+    while (i < n) {
+        size_t start = i;
+        // advance until delimiter or EOF
+        while (i < n && !parse_is_delim(data[i])) i++;
+        if (i < n && parse_is_delim(data[i])) {
+            i++; // include delimiter
+            // include trailing whitespace
+            while (i < n && (data[i] == ' ' || data[i] == '\n' || data[i] == '\t' || data[i] == '\r')) i++;
+        }
+        size_t end = i; // [start,end)
+        if (idx == sidx) {
+            size_t rlen = strnlen(repl, 2048);
+            if (rlen > 0) fwrite(repl, 1, rlen, tf);
+            replaced = 1;
+        } else {
+            if (end > start) fwrite(data + start, 1, end - start, tf);
+        }
+        idx++;
+    }
+
+    // Handle empty file case or missing last sentence (no delim)
+    if (idx == 0) {
+        // empty file — index must be 0 to replace
+        if (sidx == 0) {
+            size_t rlen = strnlen(repl, 2048);
+            if (rlen > 0) fwrite(repl, 1, rlen, tf);
+            replaced = 1;
+            idx = 1;
+        }
+    }
+
+    fclose(tf);
+
+    // If target is exactly the next sentence (append), write it now
+    if (!replaced && sidx == idx) {
+        FILE* tf2 = fopen(tmppath, "ab");
+        if (!tf2) {
+            remove(tmppath);
+            snprintf(errbuf, errlen, "Tmp reopen failed");
+            free(data);
+            return -1;
+        }
+        // Auto-insert a single space between sentences if the existing content
+        // does not end with whitespace (so "One." + "Two." becomes "One. Two.")
+        if (n > 0) {
+            char last = data[n - 1];
+            if (!(last == ' ' || last == '\n' || last == '\t' || last == '\r')) {
+                fputc(' ', tf2);
+            }
+        }
+        size_t rlen = strnlen(repl, 2048);
+        if (rlen > 0) fwrite(repl, 1, rlen, tf2);
+        fclose(tf2);
+        replaced = 1;
+        idx++;
+    }
+
+    free(data);
+
+    if (!replaced || sidx < 0 || sidx > idx) {
+        // cleanup tmp
+        remove(tmppath);
+        snprintf(errbuf, errlen, "Sentence index out of range");
+        return -1;
+    }
+
+    // Atomically replace
+    if (rename(tmppath, filepath) != 0) {
+        remove(tmppath);
+        snprintf(errbuf, errlen, "Rename failed");
+        return -1;
+    }
+    return 0;
+}
+
+int ss_write_replace_sentence(const char* filename, int sidx, const char* repl, char* errbuf, size_t errlen) {
+    if (!is_valid_filename(filename)) { snprintf(errbuf, errlen, "Invalid filename"); return -1; }
+    if (ensure_dir(STORAGE_ROOT) != 0) { snprintf(errbuf, errlen, "Storage dir error"); return -1; }
+    char path[512]; snprintf(path, sizeof(path), STORAGE_ROOT "/%s", filename);
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        snprintf(errbuf, errlen, "Not found");
+        return -1;
+    }
+    int rc = ss_write_replace_sentence_impl(path, sidx, repl, errbuf, errlen);
+    if (rc == 0) {
+        // touch metadata 'updated'
+        char meta[512]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", filename);
+        FILE* mf = fopen(meta, "a");
+        if (mf) { time_t now = time(NULL); fprintf(mf, "updated:%lld\n", (long long)now); fclose(mf); }
+    }
+    return rc;
+}
+
 /**
  * @brief Thread to listen for direct Client connections (for READ, WRITE, etc.)
  */
+typedef struct {
+    int client_socket;
+} ClientSessionArgs;
+
+static void send_error_to(int sock, int code, const char* msg) {
+    MsgHeader h = {0};
+    MsgError e = {0};
+    h.command = CMD_ERROR;
+    h.payload_size = sizeof(MsgError);
+    e.code = code;
+    strncpy(e.message, msg ? msg : "error", sizeof(e.message)-1);
+    send_all(sock, &h, sizeof(h));
+    send_all(sock, &e, sizeof(e));
+}
+
+static void* handle_one_client(void* arg) {
+    ClientSessionArgs* a = (ClientSessionArgs*)arg;
+    int client_socket = a->client_socket;
+    free(a);
+
+    // Try to detect whether the client is using header-based protocol (robustly)
+    MsgHeader peek;
+    ssize_t p = recv(client_socket, &peek, sizeof(peek), MSG_PEEK);
+    bool use_header = false;
+    if (p >= (ssize_t)sizeof(peek)) {
+        // Validate that the peeked bytes look like a real header
+        int cmd = (int)peek.command;
+        int ps  = (int)peek.payload_size;
+        if ((cmd == CMD_READ_FILE      && ps == (int)sizeof(MsgReadFile)) ||
+            (cmd == CMD_WRITE_FILE     && ps == (int)sizeof(MsgWriteFile)) ||
+            (cmd == CMD_WRITE_BEGIN    && ps == (int)sizeof(MsgWriteBegin)) ||
+            (cmd == CMD_WRITE_DONE     && ps == (int)sizeof(MsgWriteDone))) {
+            use_header = true;
+        }
+    }
+    if (use_header) {
+        // Header-based loop
+        while (true) {
+            MsgHeader h;
+            if (!recv_all(client_socket, &h, sizeof(h))) {
+                break; // disconnected
+            }
+
+            switch (h.command) {
+                case CMD_READ_FILE: {
+                    if (h.payload_size != (int)sizeof(MsgReadFile)) {
+                        send_error_to(client_socket, 400, "Bad payload size");
+                        // Drain any unexpected payload
+                        size_t rem = h.payload_size; char drain[512];
+                        while (rem > 0) { size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(client_socket, drain, chunk)) break; rem -= chunk; }
+                        continue;
+                    }
+                    MsgReadFile req;
+                    if (!recv_all(client_socket, &req, sizeof(req))) {
+                        break;
+                    }
+                    if (!is_valid_filename(req.filename)) {
+                        send_error_to(client_socket, 400, "Invalid filename");
+                        continue;
+                    }
+                    char path[512];
+                    snprintf(path, sizeof(path), STORAGE_ROOT "/%s", req.filename);
+                    struct stat st;
+                    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+                        send_error_to(client_socket, 404, "Not found");
+                        continue;
+                    }
+                    FILE* f = fopen(path, "rb");
+                    if (!f) { send_error_to(client_socket, 500, "Open failed"); continue; }
+                    // Announce payload size as file size
+                    MsgHeader rh = { .command = CMD_ACK, .payload_size = (int)st.st_size };
+                    if (!send_all(client_socket, &rh, sizeof(rh))) { fclose(f); break; }
+                    // Stream exact st_size bytes
+                    char buf[4096]; size_t remaining = (size_t)st.st_size;
+                    while (remaining > 0) {
+                        size_t to_read = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+                        size_t nr = fread(buf, 1, to_read, f);
+                        if (nr == 0) break;
+                        if (!send_all(client_socket, buf, nr)) { remaining = 0; break; }
+                        remaining -= nr;
+                    }
+                    fclose(f);
+                    continue;
+                }
+                case CMD_WRITE_FILE: {
+                    if (h.payload_size != (int)sizeof(MsgWriteFile)) {
+                        send_error_to(client_socket, 400, "Bad payload size");
+                        // Drain
+                        size_t rem = h.payload_size; char drain[512];
+                        while (rem > 0) { size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(client_socket, drain, chunk)) break; rem -= chunk; }
+                        continue;
+                    }
+                    MsgWriteFile req;
+                    if (!recv_all(client_socket, &req, sizeof(req))) {
+                        break;
+                    }
+                    if (!is_valid_filename(req.filename) || req.sentence_index < 0) {
+                        send_error_to(client_socket, 400, "Invalid arguments");
+                        continue;
+                    }
+                    // If no lock, acquire under this owner; if locked by another owner, reject; if locked by same owner, allow update
+                    int locked = (sentence_lock_find(req.filename, req.sentence_index) >= 0);
+                    if (!locked) {
+                        if (sentence_lock_acquire_nowait_owner(req.filename, req.sentence_index, client_socket) != 0) {
+                            send_error_to(client_socket, 423, "Sentence is locked");
+                            continue;
+                        }
+                    } else if (!sentence_lock_owned_by(req.filename, req.sentence_index, client_socket)) {
+                        send_error_to(client_socket, 423, "Sentence is locked by another client");
+                        continue;
+                    }
+                    // Perform sentence-level replacement under this lock
+                    char err[256] = {0};
+                    // Helper does the actual file rewrite
+                    extern int ss_write_replace_sentence(const char* filename, int sidx, const char* repl, char* errbuf, size_t errlen);
+                    int wrc = ss_write_replace_sentence(req.filename, req.sentence_index, req.replacement, err, sizeof(err));
+                    if (wrc == 0) {
+                        // Return ACK; keep lock held until client sends CMD_WRITE_DONE
+                        MsgHeader rh = { .command = CMD_ACK, .payload_size = 0 };
+                        if (!send_all(client_socket, &rh, sizeof(rh))) {
+                            // client gone; proactively release to avoid dangling lock
+                            sentence_lock_release(req.filename, req.sentence_index);
+                            break;
+                        }
+                    } else {
+                        // On failure, release the lock so client can retry
+                        sentence_lock_release(req.filename, req.sentence_index);
+                        send_error_to(client_socket, 500, err[0] ? err : "WRITE failed");
+                    }
+                    continue;
+                }
+                case CMD_WRITE_BEGIN: {
+                    if (h.payload_size != (int)sizeof(MsgWriteBegin)) {
+                        send_error_to(client_socket, 400, "Bad payload size");
+                        // Drain
+                        size_t rem = h.payload_size; char drain[512];
+                        while (rem > 0) { size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(client_socket, drain, chunk)) break; rem -= chunk; }
+                        continue;
+                    }
+                    MsgWriteBegin req;
+                    if (!recv_all(client_socket, &req, sizeof(req))) { break; }
+                    if (!is_valid_filename(req.filename) || req.sentence_index < 0) {
+                        send_error_to(client_socket, 400, "Invalid arguments");
+                        continue;
+                    }
+                    if (sentence_lock_acquire_nowait_owner(req.filename, req.sentence_index, client_socket) != 0) {
+                        send_error_to(client_socket, 423, "Sentence is locked");
+                        continue;
+                    }
+                    MsgHeader rh = { .command = CMD_ACK, .payload_size = 0 };
+                    send_all(client_socket, &rh, sizeof(rh));
+                    continue;
+                }
+                case CMD_WRITE_DONE: {
+                    if (h.payload_size != (int)sizeof(MsgWriteDone)) {
+                        send_error_to(client_socket, 400, "Bad payload size");
+                        // Drain
+                        size_t rem = h.payload_size; char drain[512];
+                        while (rem > 0) { size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(client_socket, drain, chunk)) break; rem -= chunk; }
+                        continue;
+                    }
+                    MsgWriteDone done;
+                    if (!recv_all(client_socket, &done, sizeof(done))) {
+                        break;
+                    }
+                    // Only owner can release
+                    if (!sentence_lock_owned_by(done.filename, done.sentence_index, client_socket)) {
+                        send_error_to(client_socket, 409, "Not lock owner");
+                        continue;
+                    }
+                    sentence_lock_release(done.filename, done.sentence_index);
+                    MsgHeader rh = { .command = CMD_ACK, .payload_size = 0 };
+                    send_all(client_socket, &rh, sizeof(rh));
+                    continue;
+                }
+                default: {
+                    // Drain unknown payload
+                    size_t rem = h.payload_size; char drain[512];
+                    while (rem > 0) { size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(client_socket, drain, chunk)) break; rem -= chunk; }
+                    send_error_to(client_socket, 400, "Unknown command");
+                    continue;
+                }
+            }
+        }
+    } else {
+        // Legacy simple protocol: read a filename line, send content, then close
+        char fname[MAX_FILENAME_LEN+2];
+        size_t fpos = 0;
+        while (fpos < sizeof(fname)-1) {
+            char ch;
+            ssize_t r = recv(client_socket, &ch, 1, 0);
+            if (r <= 0) break; // disconnect or error
+            if (ch == '\n') break;
+            fname[fpos++] = ch;
+        }
+        fname[fpos] = '\0';
+
+        if (fpos == 0 || !is_valid_filename(fname)) {
+            const char* msg = "ERROR: invalid filename\n";
+            send_all(client_socket, msg, strlen(msg));
+            close(client_socket);
+            return NULL;
+        }
+
+        char path[512];
+        snprintf(path, sizeof(path), STORAGE_ROOT "/%s", fname);
+        FILE* f = fopen(path, "rb");
+        if (!f) {
+            const char* msg = "ERROR: not found\n";
+            send_all(client_socket, msg, strlen(msg));
+            close(client_socket);
+            return NULL;
+        }
+        char buf[4096];
+        size_t nread;
+        while ((nread = fread(buf, 1, sizeof(buf), f)) > 0) {
+            if (!send_all(client_socket, buf, nread)) {
+                break;
+            }
+        }
+        fclose(f);
+    }
+
+    close(client_socket);
+    // Release any locks held by this client
+    sentence_lock_release_all_for_owner(client_socket);
+    return NULL;
+}
+
 void* handle_client_connections(void* arg) {
     int server_fd;
     struct sockaddr_in address;
@@ -214,44 +647,19 @@ void* handle_client_connections(void* arg) {
             continue;
         }
         printf("[SS] Received a direct client connection!\n");
-        
-        // Simple protocol: client sends a single line with the filename, we return file content and close.
-        char fname[MAX_FILENAME_LEN+2];
-        size_t fpos = 0;
-        while (fpos < sizeof(fname)-1) {
-            char ch;
-            ssize_t r = recv(client_socket, &ch, 1, 0);
-            if (r <= 0) break; // disconnect or error
-            if (ch == '\n') break;
-            fname[fpos++] = ch;
-        }
-        fname[fpos] = '\0';
 
-        if (fpos == 0 || !is_valid_filename(fname)) {
-            const char* msg = "ERROR: invalid filename\n";
-            send_all(client_socket, msg, strlen(msg));
+        // Spawn a detached thread per client to handle header-based loop or legacy read
+        pthread_t tid;
+        ClientSessionArgs* a = (ClientSessionArgs*)malloc(sizeof(ClientSessionArgs));
+        if (!a) { close(client_socket); continue; }
+        a->client_socket = client_socket;
+        if (pthread_create(&tid, NULL, handle_one_client, a) != 0) {
+            perror("[SS] pthread_create (client session)");
             close(client_socket);
+            free(a);
             continue;
         }
-
-        char path[512];
-        snprintf(path, sizeof(path), STORAGE_ROOT "/%s", fname);
-        FILE* f = fopen(path, "rb");
-        if (!f) {
-            const char* msg = "ERROR: not found\n";
-            send_all(client_socket, msg, strlen(msg));
-            close(client_socket);
-            continue;
-        }
-        char buf[4096];
-        size_t nread;
-        while ((nread = fread(buf, 1, sizeof(buf), f)) > 0) {
-            if (!send_all(client_socket, buf, nread)) {
-                break;
-            }
-        }
-        fclose(f);
-        close(client_socket);
+        pthread_detach(tid);
     }
     return NULL;
 }
@@ -415,13 +823,12 @@ void* listen_to_nm(void* arg) {
                         if (list_contains(readers, msg.target)) { nm_send_error(409, "User already has reader access"); break; }
                         list_append(readers, sizeof(readers), msg.target);
                     }
-                } else { // REM_ACCESS
-                    if (msg.is_writer) {
-                        if (!list_contains(writers, msg.target)) { nm_send_error(404, "User not found in writers"); break; }
-                        (void)list_remove(writers, msg.target);
-                    } else {
-                        if (!list_contains(readers, msg.target)) { nm_send_error(404, "User not found in readers"); break; }
-                        (void)list_remove(readers, msg.target);
+                } else { // REM_ACCESS: remove from BOTH readers and writers (role-agnostic)
+                    int removed_w = list_remove(writers, msg.target);
+                    int removed_r = list_remove(readers, msg.target);
+                    if (removed_w == 0 && removed_r == 0) {
+                        nm_send_error(404, "User not found");
+                        break;
                     }
                 }
 
