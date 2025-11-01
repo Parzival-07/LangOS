@@ -11,6 +11,65 @@
 #include <time.h>
 #include <errno.h>
 #include <dirent.h>
+#include <ctype.h>
+
+// --- Helpers for parsing and updating access lists ---
+static int list_contains(const char* list, const char* user) {
+    if (!user || !*user) return 0;
+    char tmp[1024];
+    strncpy(tmp, list ? list : "", sizeof(tmp)-1);
+    tmp[sizeof(tmp)-1] = 0;
+    for (char* p = tmp; *p; ++p) { if (*p==','||*p=='\n'||*p=='\r'||*p=='\t') *p=' '; }
+    char* ctx = NULL; char* tok = strtok_r(tmp, " ", &ctx);
+    while (tok) { if (strcmp(tok, user) == 0) return 1; tok = strtok_r(NULL, " ", &ctx); }
+    return 0;
+}
+
+static void list_append(char* list, size_t cap, const char* user) {
+    if (!user || !*user) return;
+    size_t len = strlen(list);
+    if (len == 0) {
+        strncat(list, user, cap - strlen(list) - 1);
+    } else {
+        strncat(list, ",", cap - strlen(list) - 1);
+        strncat(list, user, cap - strlen(list) - 1);
+    }
+}
+
+static int list_remove(char* list, const char* user) {
+    char tmp[1024]; strncpy(tmp, list ? list : "", sizeof(tmp)-1); tmp[sizeof(tmp)-1] = 0;
+    char out[1024] = "";
+    char* ctx = NULL; char* tok = strtok_r(tmp, ", \t\r\n", &ctx);
+    int first = 1;
+    int removed = 0;
+    while (tok) {
+        if (strcmp(tok, user) != 0) {
+            if (!first) strncat(out, ",", sizeof(out)-1);
+            strncat(out, tok, sizeof(out)-1);
+            first = 0;
+        } else {
+            removed++;
+        }
+        tok = strtok_r(NULL, ", \t\r\n", &ctx);
+    }
+    strncpy(list, out, 1023);
+    list[1023] = 0;
+    return removed;
+}
+
+static void trim_both(char* s) {
+    if (!s) return;
+    // left trim
+    char* p = s;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (p != s) {
+        size_t len = strlen(p);
+        memmove(s, p, len + 1);
+    }
+    // right trim
+    size_t n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n-1])) { s[n-1] = 0; n--; }
+}
 
 int client_listen_port;
 int nm_socket;
@@ -84,8 +143,9 @@ static int ss_create_file_do(const MsgCreateFile* m, char* errbuf, size_t errlen
     fprintf(mf, "owner:%s\n", m->owner);
     fprintf(mf, "created:%lld\n", (long long)now);
     fprintf(mf, "updated:%lld\n", (long long)now);
-    fprintf(mf, "readers: \n");
-    fprintf(mf, "writers: \n");
+    // Write empty lists with no trailing space after colon for stable formatting
+    fprintf(mf, "readers:\n");
+    fprintf(mf, "writers:\n");
     fclose(mf);
 
     return 0;
@@ -223,7 +283,7 @@ void* listen_to_nm(void* arg) {
         printf("[SS] Received command %d from Name Server.\n", header.command);
         
         // Handle commands from NM
-        switch (header.command) {
+    switch (header.command) {
             case CMD_CREATE_FILE: {
                 if (header.payload_size != sizeof(MsgCreateFile)) {
                     nm_send_error(400, "Bad payload size");
@@ -309,6 +369,116 @@ void* listen_to_nm(void* arg) {
                     printf("[SS] DELETE failed for '%s'\n", msg.filename);
                     nm_send_error(404, "DELETE failed");
                 }
+                break;
+            }
+            case CMD_ADD_ACCESS:
+            case CMD_REM_ACCESS: {
+                if (header.payload_size != sizeof(MsgAccessChange)) {
+                    nm_send_error(400, "Bad payload size");
+                    break;
+                }
+                MsgAccessChange msg;
+                if (!recv_all(nm_socket, &msg, sizeof(msg))) { nm_send_error(400, "Payload read failed"); break; }
+                if (!is_valid_filename(msg.filename)) { nm_send_error(400, "Invalid filename"); break; }
+
+                // Load metadata
+                char meta[512]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", msg.filename);
+                FILE* mf = fopen(meta, "r");
+                if (!mf) { nm_send_error(404, "File not found"); break; }
+                char owner[MAX_USERNAME_LEN] = {0};
+                long long created=0, updated=0;
+                char readers[1024] = {0}, writers[1024] = {0};
+                char line[2048];
+                while (fgets(line, sizeof(line), mf)) {
+                    if (strncmp(line, "owner:", 6) == 0) { sscanf(line+6, "%63s", owner); }
+                    else if (strncmp(line, "created:", 8) == 0) { sscanf(line+8, "%lld", &created); }
+                    else if (strncmp(line, "updated:", 8) == 0) { sscanf(line+8, "%lld", &updated); }
+                    else if (strncmp(line, "readers:", 8) == 0) { strncpy(readers, line+8, sizeof(readers)-1); }
+                    else if (strncmp(line, "writers:", 8) == 0) { strncpy(writers, line+8, sizeof(writers)-1); }
+                }
+                fclose(mf);
+                // Trim leading and trailing whitespace so formatting is stable
+                trim_both(readers);
+                trim_both(writers);
+
+                // Owner check
+                if (owner[0]==0 || strncmp(owner, msg.requester, MAX_USERNAME_LEN) != 0) {
+                    nm_send_error(403, "Only owner may change access");
+                    break;
+                }
+
+                if (header.command == CMD_ADD_ACCESS) {
+                    if (msg.is_writer) {
+                        if (list_contains(writers, msg.target)) { nm_send_error(409, "User already has writer access"); break; }
+                        list_append(writers, sizeof(writers), msg.target);
+                    } else {
+                        if (list_contains(readers, msg.target)) { nm_send_error(409, "User already has reader access"); break; }
+                        list_append(readers, sizeof(readers), msg.target);
+                    }
+                } else { // REM_ACCESS
+                    if (msg.is_writer) {
+                        if (!list_contains(writers, msg.target)) { nm_send_error(404, "User not found in writers"); break; }
+                        (void)list_remove(writers, msg.target);
+                    } else {
+                        if (!list_contains(readers, msg.target)) { nm_send_error(404, "User not found in readers"); break; }
+                        (void)list_remove(readers, msg.target);
+                    }
+                }
+
+                // Save metadata back (only on success)
+                time_t now = time(NULL); updated = (long long)now;
+                mf = fopen(meta, "w");
+                if (!mf) { nm_send_error(500, "Failed to write meta"); break; }
+                fprintf(mf, "owner:%s\n", owner);
+                fprintf(mf, "created:%lld\n", created);
+                fprintf(mf, "updated:%lld\n", updated);
+                fprintf(mf, "readers:%s%s\n", (readers[0]?" ":""), readers);
+                fprintf(mf, "writers:%s%s\n", (writers[0]?" ":""), writers);
+                fclose(mf);
+
+                MsgHeader ack = { .command = CMD_ACK, .payload_size = 0 };
+                send_all(nm_socket, &ack, sizeof(ack));
+                break;
+            }
+            case CMD_INFO: {
+                if (header.payload_size != sizeof(MsgInfoRequest)) { nm_send_error(400, "Bad payload size"); break; }
+                MsgInfoRequest req; if (!recv_all(nm_socket, &req, sizeof(req))) { nm_send_error(400, "Payload read failed"); break; }
+                if (!is_valid_filename(req.filename)) { nm_send_error(400, "Invalid filename"); break; }
+                char meta[512]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", req.filename);
+                FILE* mf = fopen(meta, "r"); if (!mf) { nm_send_error(404, "File not found"); break; }
+                char owner[MAX_USERNAME_LEN] = {0};
+                long long created=0, updated=0;
+                char readers[1024] = {0}, writers[1024] = {0};
+                char line[2048];
+                while (fgets(line, sizeof(line), mf)) {
+                    if (strncmp(line, "owner:", 6) == 0) { sscanf(line+6, "%63s", owner); }
+                    else if (strncmp(line, "created:", 8) == 0) { sscanf(line+8, "%lld", &created); }
+                    else if (strncmp(line, "updated:", 8) == 0) { sscanf(line+8, "%lld", &updated); }
+                    else if (strncmp(line, "readers:", 8) == 0) { strncpy(readers, line+8, sizeof(readers)-1); }
+                    else if (strncmp(line, "writers:", 8) == 0) { strncpy(writers, line+8, sizeof(writers)-1); }
+                }
+                fclose(mf);
+                // Trim leading and trailing whitespace
+                trim_both(readers);
+                trim_both(writers);
+                // Build info string
+                MsgInfoResponse resp = {0};
+                char created_buf[64]={0}, updated_buf[64]={0};
+                time_t cr=(time_t)created, up=(time_t)updated;
+                struct tm tmv;
+                if (localtime_r(&cr, &tmv)) strftime(created_buf, sizeof(created_buf), "%Y-%m-%d %H:%M:%S", &tmv);
+                if (localtime_r(&up, &tmv)) strftime(updated_buf, sizeof(updated_buf), "%Y-%m-%d %H:%M:%S", &tmv);
+                snprintf(resp.info, sizeof(resp.info),
+                         "filename: %s\nowner: %s\ncreated: %s (%lld)\nupdated: %s (%lld)\nreaders: %s\nwriters: %s\n",
+                         req.filename,
+                         owner[0]?owner:"",
+                         created_buf[0]?created_buf:"", created,
+                         updated_buf[0]?updated_buf:"", updated,
+                         readers[0]?readers:"",
+                         writers[0]?writers:"");
+                MsgHeader h = { .command = CMD_INFO_RESP, .payload_size = sizeof(resp) };
+                send_all(nm_socket, &h, sizeof(h));
+                send_all(nm_socket, &resp, sizeof(resp));
                 break;
             }
             default:

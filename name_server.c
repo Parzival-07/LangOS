@@ -401,6 +401,102 @@ void* handle_connection(void* arg) {
             send_all(socket, &h, sizeof(h));
             send_all(socket, &resp, sizeof(resp));
             continue;
+        } else if ((header.command == CMD_ADD_ACCESS || header.command == CMD_REM_ACCESS) && connections[slot].type == CONN_TYPE_CLIENT) {
+            if (header.payload_size != sizeof(MsgAccessChange)) {
+                send_error(socket, 400, "Bad payload size");
+                // Drain unexpected payload
+                size_t rem = header.payload_size; char drain[256];
+                while (rem > 0) { size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(socket, drain, chunk)) break; rem -= chunk; }
+                continue;
+            }
+            MsgAccessChange req;
+            if (!recv_all(socket, &req, sizeof(req))) {
+                send_error(socket, 400, "Payload read failed");
+                continue;
+            }
+
+            // Ensure mapping up-to-date and find owning SS
+            registry_refresh_from_ss();
+            int ss_slot = -1;
+            pthread_mutex_lock(&file_registry_mutex);
+            for (int i = 0; i < file_count; i++) {
+                if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) {
+                    ss_slot = file_registry[i].ss_slot;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&file_registry_mutex);
+            if (ss_slot < 0) {
+                send_error(socket, 404, "File not found");
+                continue;
+            }
+
+            // Overwrite requester with authenticated client username
+            pthread_mutex_lock(&connections_mutex);
+            strncpy(req.requester, connections[slot].username, MAX_USERNAME_LEN - 1);
+            req.requester[MAX_USERNAME_LEN - 1] = '\0';
+            int ss_sock = connections[ss_slot].socket;
+            pthread_mutex_unlock(&connections_mutex);
+
+            // Forward to SS and proxy response
+            MsgHeader fwd = {0};
+            fwd.command = header.command;
+            fwd.payload_size = sizeof(req);
+            if (!send_all(ss_sock, &fwd, sizeof(fwd)) || !send_all(ss_sock, &req, sizeof(req))) {
+                send_error(socket, 502, "Failed to contact Storage Server");
+                continue;
+            }
+            MsgHeader rs;
+            if (!recv_all(ss_sock, &rs, sizeof(rs))) {
+                send_error(socket, 502, "No response from Storage Server");
+                continue;
+            }
+            if (!send_all(socket, &rs, sizeof(rs))) continue;
+            // Proxy any payload
+            size_t rem = rs.payload_size; char buf[512];
+            while (rem > 0) {
+                size_t chunk = rem > sizeof(buf) ? sizeof(buf) : rem;
+                if (!recv_all(ss_sock, buf, chunk)) break;
+                if (!send_all(socket, buf, chunk)) break;
+                rem -= chunk;
+            }
+            continue;
+        } else if (header.command == CMD_INFO && connections[slot].type == CONN_TYPE_CLIENT) {
+            if (header.payload_size != sizeof(MsgInfoRequest)) {
+                send_error(socket, 400, "Bad payload size");
+                // Drain
+                size_t rem = header.payload_size; char drain[256];
+                while (rem > 0) { size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(socket, drain, chunk)) break; rem -= chunk; }
+                continue;
+            }
+            MsgInfoRequest req;
+            if (!recv_all(socket, &req, sizeof(req))) {
+                send_error(socket, 400, "Payload read failed");
+                continue;
+            }
+
+            // Find owning SS
+            registry_refresh_from_ss();
+            int ss_slot = -1;
+            pthread_mutex_lock(&file_registry_mutex);
+            for (int i = 0; i < file_count; i++) {
+                if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
+            }
+            pthread_mutex_unlock(&file_registry_mutex);
+            if (ss_slot < 0) { send_error(socket, 404, "File not found"); continue; }
+
+            pthread_mutex_lock(&connections_mutex);
+            int ss_sock = connections[ss_slot].socket;
+            pthread_mutex_unlock(&connections_mutex);
+
+            MsgHeader fwd = {0}; fwd.command = CMD_INFO; fwd.payload_size = sizeof(req);
+            if (!send_all(ss_sock, &fwd, sizeof(fwd)) || !send_all(ss_sock, &req, sizeof(req))) { send_error(socket, 502, "Failed to contact Storage Server"); continue; }
+            MsgHeader rs;
+            if (!recv_all(ss_sock, &rs, sizeof(rs))) { send_error(socket, 502, "No response from Storage Server"); continue; }
+            if (!send_all(socket, &rs, sizeof(rs))) continue;
+            size_t rem = rs.payload_size; char buf[512];
+            while (rem > 0) { size_t chunk = rem > sizeof(buf) ? sizeof(buf) : rem; if (!recv_all(ss_sock, buf, chunk)) break; if (!send_all(socket, buf, chunk)) break; rem -= chunk; }
+            continue;
         }
 
         if (header.command == CMD_DELETE_FILE && connections[slot].type == CONN_TYPE_CLIENT) {
