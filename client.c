@@ -6,6 +6,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 
 int nm_socket;
 char username[MAX_USERNAME_LEN];
@@ -254,7 +256,77 @@ int main() {
                 printf("[Client] Unexpected response (%d).\n", rh.command);
             }
         } else if (strcmp(command, "READ") == 0) {
-            printf("[Client] Command '%s' not implemented yet.\n", command);
+            char* fname = strtok(NULL, " ");
+            if (!fname) {
+                printf("[Client] Usage: READ <filename>\n");
+                continue;
+            }
+
+            // Ask NM for SS address owning this file
+            MsgHeader h = {0};
+            MsgReadFile req = {0};
+            h.command = CMD_READ_FILE;
+            h.payload_size = sizeof(req);
+            strncpy(req.filename, fname, MAX_FILENAME_LEN - 1);
+
+            if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &req, sizeof(req))) {
+                fprintf(stderr, "[Client] Failed to send READ to NM.\n");
+                continue;
+            }
+
+            MsgHeader rh;
+            if (!recv_all(nm_socket, &rh, sizeof(rh))) {
+                fprintf(stderr, "[Client] No response from NM.\n");
+                continue;
+            }
+            if (rh.command != CMD_READ_FILE_RESP || rh.payload_size != sizeof(MsgReadFileResponse)) {
+                // Drain unexpected payload
+                size_t rem = rh.payload_size; char drain[512];
+                while (rem > 0) { size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(nm_socket, drain, chunk)) break; rem -= chunk; }
+                printf("[Client] Unexpected response (%d).\n", rh.command);
+                continue;
+            }
+
+            MsgReadFileResponse addr = {0};
+            if (!recv_all(nm_socket, &addr, sizeof(addr))) {
+                fprintf(stderr, "[Client] Failed to read READ response payload.\n");
+                continue;
+            }
+            if (!addr.found || addr.ss_port <= 0 || addr.ss_ip[0] == '\0') {
+                printf("[Client] READ failed: file not found.\n");
+                continue;
+            }
+
+            // Connect directly to SS
+            int ss_fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (ss_fd < 0) { perror("[Client] socket"); continue; }
+            struct sockaddr_in ss_addr; memset(&ss_addr, 0, sizeof(ss_addr));
+            ss_addr.sin_family = AF_INET;
+            ss_addr.sin_port = htons((uint16_t)addr.ss_port);
+            if (inet_pton(AF_INET, addr.ss_ip, &ss_addr.sin_addr) <= 0) {
+                perror("[Client] inet_pton"); close(ss_fd); continue;
+            }
+            if (connect(ss_fd, (struct sockaddr*)&ss_addr, sizeof(ss_addr)) < 0) {
+                perror("[Client] connect to SS"); close(ss_fd); continue;
+            }
+
+            // Send filename followed by newline (simple direct protocol)
+            size_t flen = strnlen(fname, MAX_FILENAME_LEN);
+            if (!send_all(ss_fd, fname, flen) || !send_all(ss_fd, "\n", 1)) {
+                fprintf(stderr, "[Client] Failed to send filename to SS.\n");
+                close(ss_fd); continue;
+            }
+
+            // Read all content until EOF and print
+            char buf[4096];
+            ssize_t n;
+            while ((n = recv(ss_fd, buf, sizeof(buf), 0)) > 0) {
+                fwrite(buf, 1, (size_t)n, stdout);
+            }
+            if (n < 0) perror("[Client] recv from SS");
+            // Ensure a trailing newline for cleanliness
+            if (flen > 0) printf("\n");
+            close(ss_fd);
         } else {
             printf("[Client] Unknown command: %s\n", command);
         }

@@ -13,6 +13,7 @@
 #define MAX_USERNAME_LEN 64
 #define MAX_FILENAME_LEN 256
 #define MAX_ERROR_MSG_LEN 256
+#define MAX_IP_LEN 64
 
 // --- COMMAND DEFINITIONS ---
 // This is the "language" our servers speak.
@@ -36,7 +37,12 @@ typedef enum {
 
     // NM <-> SS (internal listing used by NM to refresh registry)
     CMD_SS_LIST_FILES = 320,
-    CMD_SS_LIST_FILES_RESP = 321
+    CMD_SS_LIST_FILES_RESP = 321,
+
+    // READ routing and response
+    // Client <-> NM
+    CMD_READ_FILE = 330,
+    CMD_READ_FILE_RESP = 331
 } CommandCode;
 
 // --- DATA STRUCTURES ---
@@ -91,6 +97,20 @@ typedef struct {
 typedef struct {
     char files[16384];
 } MsgSSFileListResponse;
+
+// Data for CMD_READ_FILE
+// Client -> NM
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+} MsgReadFile;
+
+// Data for CMD_READ_FILE_RESP
+// NM -> Client: IP/port of SS to connect to, and found flag
+typedef struct {
+    int found;                 // 1 if found, 0 otherwise
+    char ss_ip[MAX_IP_LEN];    // IPv4 string (e.g., "127.0.0.1")
+    int ss_port;               // SS client listen port
+} MsgReadFileResponse;
 
 
 // --- HELPER FUNCTIONS ---
