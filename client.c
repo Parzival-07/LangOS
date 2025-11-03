@@ -393,9 +393,10 @@ int main() {
             } else {
                 printf("[Client] Current sentence is empty.\n");
             }
-            printf("[Client] Enter '<word_index> <content>' (1-based) to edit words, or:\n");
-            printf("[Client]   'INDEX 1: <sentence>' to replace this sentence\n");
-            printf("[Client]   'INDEX 2: <sentence>' to insert a new sentence after this one\n");
+            printf("[Client] Enter one of the following then ETIRW:\n");
+            printf("[Client]   '1 <sentence>' to replace this sentence\n");
+            printf("[Client]   '2 <sentence>' to insert a new sentence after this one\n");
+            printf("[Client]   (optional) 'INDEX 1: <sentence>' or 'INDEX 2: <sentence>' also supported)\n");
             printf("[Client] Type 'ETIRW' to finish.\n");
 
             int sentence_mode = 0; // 0=word-edit, 1=replace(current), 2=insert(after)
@@ -422,32 +423,23 @@ int main() {
                     printf("[Client] Queued sentence %s with text: '%s'\n", (sentence_mode==1?"replacement":"insertion"), sentence_text);
                     continue;
                 }
-                // parse index and content
+                // Numeric entry: interpret strictly as sentence-level (1 or 2)
                 char* p = wline; while (*p==' ') p++;
                 if (!*p) continue;
                 char* endptr = NULL; long idx1 = strtol(p, &endptr, 10);
-                if (p == endptr) { printf("[Client] Expected '<index> <content>'.\n"); continue; }
+                if (p == endptr) { printf("[Client] Expected '<index> <sentence>'.\n"); continue; }
                 while (*endptr==' ') endptr++;
                 char* content = endptr; if (!content) content = "";
-                if (idx1 <= 0 || idx1 > (long)wcount + 1) { printf("[Client] Index out of range (1..%d).\n", wcount + 1); continue; }
-                long idx = idx1 - 1; // convert to 0-based
-                if (idx == wcount) {
-                    // append
-                    if (wcount == (int)cap) { cap = cap ? cap*2 : 8; char** nw = realloc(words, cap * sizeof(char*)); if (!nw) { fprintf(stderr, "[Client] OOM.\n"); break; } words = nw; }
-                    words[wcount++] = strdup(content);
-                } else {
-                    // replace
-                    free(words[idx]); words[idx] = strdup(content);
-                }
+                if (idx1 != 1 && idx1 != 2) { printf("[Client] Only sentence indices 1 (replace) or 2 (insert-after) are allowed.\n"); continue; }
+                if (sentence_text) { free(sentence_text); sentence_text = NULL; }
+                sentence_text = strdup(content);
+                sentence_mode = (int)idx1;
+                printf("[Client] Queued sentence %s with text: '%s'\n", (sentence_mode==1?"replacement":"insertion"), sentence_text);
+                continue;
             }
 
-            // Build final sentence
-            size_t final_len = 0; for (int i = 0; i < wcount; i++) final_len += strlen(words[i]) + (i+1 < wcount ? 1 : 0);
-            char* final_sentence = (char*)malloc(final_len + 1); if (!final_sentence) { fprintf(stderr, "[Client] OOM.\n"); }
-            if (final_sentence) {
-                size_t pos = 0; for (int i = 0; i < wcount; i++) { size_t wl = strlen(words[i]); memcpy(final_sentence+pos, words[i], wl); pos += wl; if (i+1 < wcount) final_sentence[pos++] = ' '; }
-                final_sentence[pos] = '\0';
-            }
+            // No word-level editing output is used; we operate at sentence level only.
+            char* final_sentence = NULL; // unused unless we fall back; kept for cleanup path
 
             // Apply write (sentence-level op takes precedence if provided)
             MsgWriteFile w = (MsgWriteFile){0}; strncpy(w.filename, fname, MAX_FILENAME_LEN - 1);

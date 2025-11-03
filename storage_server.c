@@ -296,6 +296,10 @@ static int ss_write_replace_sentence_impl(const char* filepath, int sidx, const 
         if (idx == sidx) {
             size_t rlen = strnlen(repl, 2048);
             if (rlen > 0) fwrite(repl, 1, rlen, tf);
+            // preserve original trailing whitespace so next sentence stays separated
+            size_t ws_start = end;
+            while (ws_start > start && (data[ws_start-1] == ' ' || data[ws_start-1] == '\n' || data[ws_start-1] == '\t' || data[ws_start-1] == '\r')) ws_start--;
+            if (end > ws_start) fwrite(data + ws_start, 1, end - ws_start, tf);
             replaced = 1;
         } else {
             if (end > start) fwrite(data + start, 1, end - start, tf);
