@@ -377,6 +377,122 @@ int ss_write_replace_sentence(const char* filename, int sidx, const char* repl, 
     return rc;
 }
 
+// Insert a new sentence at index 'insert_idx' (0-based) with 'repl' text
+// shifting existing sentences at and after that index to the right.
+static int ss_write_insert_sentence_impl(const char* filepath, int insert_idx, const char* repl, char* errbuf, size_t errlen) {
+    if (insert_idx < 0) { snprintf(errbuf, errlen, "Bad index"); return -1; }
+    FILE* f = fopen(filepath, "rb");
+    if (!f) { snprintf(errbuf, errlen, "Open failed"); return -1; }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); snprintf(errbuf, errlen, "Seek failed"); return -1; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); snprintf(errbuf, errlen, "Tell failed"); return -1; }
+    rewind(f);
+    char* data = (char*)malloc((size_t)sz + 1);
+    if (!data) { fclose(f); snprintf(errbuf, errlen, "OOM"); return -1; }
+    size_t rd = fread(data, 1, (size_t)sz, f);
+    fclose(f);
+    data[rd] = '\0';
+
+    char tmppath[600]; snprintf(tmppath, sizeof(tmppath), "%s.tmp", filepath);
+    FILE* tf = fopen(tmppath, "wb");
+    if (!tf) { free(data); snprintf(errbuf, errlen, "Tmp open failed"); return -1; }
+
+    size_t i = 0, n = rd; int idx = 0; int inserted = 0;
+    while (i < n) {
+        size_t start = i;
+        while (i < n && !parse_is_delim(data[i])) i++;
+        if (i < n && parse_is_delim(data[i])) {
+            i++;
+            while (i < n && (data[i] == ' ' || data[i] == '\n' || data[i] == '\t' || data[i] == '\r')) i++;
+        }
+        size_t end = i;
+
+        if (!inserted && idx == insert_idx - 1) {
+            // write previous sentence without its trailing whitespace
+            size_t ws_start = end;
+            while (ws_start > start && (data[ws_start-1] == ' ' || data[ws_start-1] == '\n' || data[ws_start-1] == '\t' || data[ws_start-1] == '\r')) ws_start--;
+            if (ws_start > start) fwrite(data + start, 1, ws_start - start, tf);
+            // one space between previous and inserted
+            fputc(' ', tf);
+            // inserted sentence
+            size_t rlen = strnlen(repl, 2048); if (rlen > 0) fwrite(repl, 1, rlen, tf);
+            // original whitespace (between prev and next) now separates inserted and next
+            if (end > ws_start) fwrite(data + ws_start, 1, end - ws_start, tf);
+            inserted = 1;
+        } else {
+            // normal write-through
+            if (end > start) fwrite(data + start, 1, end - start, tf);
+        }
+        idx++;
+    }
+
+    if (!inserted) {
+        // If inserting at 0 into empty file or at end, just append/precede
+        if (insert_idx == 0) {
+            size_t rlen = strnlen(repl, 2048); if (rlen > 0) fwrite(repl, 1, rlen, tf);
+            if (n > 0) fputc(' ', tf);
+            if (n > 0) fwrite(data, 1, n, tf);
+            inserted = 1;
+        } else {
+            // Or append to end if index equals sentence count (handled here too)
+            // Count sentences to see if insert_idx equals idx
+            // idx currently equals sentence count
+            if (insert_idx == idx) {
+                // ensure separation
+                if (n > 0) {
+                    char last = data[n-1];
+                    if (!(last == ' ' || last == '\n' || last == '\t' || last == '\r')) fputc(' ', tf);
+                }
+                size_t rlen = strnlen(repl, 2048); if (rlen > 0) fwrite(repl, 1, rlen, tf);
+                inserted = 1;
+            }
+        }
+    }
+
+    free(data);
+    fclose(tf);
+
+    if (!inserted) { remove(tmppath); snprintf(errbuf, errlen, "Insert index out of range"); return -1; }
+    if (rename(tmppath, filepath) != 0) { remove(tmppath); snprintf(errbuf, errlen, "Rename failed"); return -1; }
+    return 0;
+}
+
+static int ss_write_insert_sentence(const char* filename, int insert_idx, const char* repl, char* errbuf, size_t errlen) {
+    if (!is_valid_filename(filename)) { snprintf(errbuf, errlen, "Invalid filename"); return -1; }
+    if (ensure_dir(STORAGE_ROOT) != 0) { snprintf(errbuf, errlen, "Storage dir error"); return -1; }
+    char path[512]; snprintf(path, sizeof(path), STORAGE_ROOT "/%s", filename);
+    struct stat st; if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) { snprintf(errbuf, errlen, "Not found"); return -1; }
+    int rc = ss_write_insert_sentence_impl(path, insert_idx, repl, errbuf, errlen);
+    if (rc == 0) {
+        char meta[512]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", filename);
+        FILE* mf = fopen(meta, "a"); if (mf) { time_t now = time(NULL); fprintf(mf, "updated:%lld\n", (long long)now); fclose(mf); }
+    }
+    return rc;
+}
+
+// --- Lock helpers for index shifts / owner lookup ---
+static int sentence_lock_find_for_owner(const char* filename, int owner_fd) {
+    int res = -1;
+    pthread_mutex_lock(&g_sentence_locks_mutex);
+    for (int i = 0; i < MAX_SENTENCE_LOCKS; i++) {
+        if (g_sentence_locks[i].in_use && g_sentence_locks[i].owner_fd == owner_fd && strncmp(g_sentence_locks[i].filename, filename, MAX_FILENAME_LEN) == 0) {
+            res = i; break;
+        }
+    }
+    pthread_mutex_unlock(&g_sentence_locks_mutex);
+    return res;
+}
+
+static void sentence_lock_shift_from(const char* filename, int from_index, int delta) {
+    pthread_mutex_lock(&g_sentence_locks_mutex);
+    for (int i = 0; i < MAX_SENTENCE_LOCKS; i++) {
+        if (g_sentence_locks[i].in_use && strncmp(g_sentence_locks[i].filename, filename, MAX_FILENAME_LEN) == 0 && g_sentence_locks[i].sentence_index >= from_index) {
+            g_sentence_locks[i].sentence_index += delta;
+        }
+    }
+    pthread_mutex_unlock(&g_sentence_locks_mutex);
+}
+
 /**
  * @brief Thread to listen for direct Client connections (for READ, WRITE, etc.)
  */
@@ -480,35 +596,74 @@ static void* handle_one_client(void* arg) {
                         send_error_to(client_socket, 400, "Invalid arguments");
                         continue;
                     }
-                    // If no lock, acquire under this owner; if locked by another owner, reject; if locked by same owner, allow update
-                    int locked = (sentence_lock_find(req.filename, req.sentence_index) >= 0);
-                    if (!locked) {
-                        if (sentence_lock_acquire_nowait_owner(req.filename, req.sentence_index, client_socket) != 0) {
-                            send_error_to(client_socket, 423, "Sentence is locked");
-                            continue;
+                    // Determine operation type: replacement of owned index OR insertion after owned index.
+                    char err[256] = {0};
+                    int target = req.sentence_index;
+                    int handled = 0;
+
+                    // Case 1: client owns the target index -> replacement
+                    if (sentence_lock_owned_by(req.filename, target, client_socket)) {
+                        int wrc = ss_write_replace_sentence(req.filename, target, req.replacement, err, sizeof(err));
+                        if (wrc == 0) {
+                            MsgHeader rh = { .command = CMD_ACK, .payload_size = 0 };
+                            send_all(client_socket, &rh, sizeof(rh));
+                        } else {
+                            send_error_to(client_socket, 500, err[0] ? err : "WRITE failed");
                         }
-                    } else if (!sentence_lock_owned_by(req.filename, req.sentence_index, client_socket)) {
-                        send_error_to(client_socket, 423, "Sentence is locked by another client");
+                        handled = 1;
+                    }
+
+                    if (handled) { continue; }
+
+                    // Case 2: client owns the previous index -> treat as insertion at 'target'
+                    if (target > 0 && sentence_lock_owned_by(req.filename, target - 1, client_socket)) {
+                        int wrc = ss_write_insert_sentence(req.filename, target, req.replacement, err, sizeof(err));
+                        if (wrc == 0) {
+                            // shift all locks at and after target by +1 (indices changed)
+                            sentence_lock_shift_from(req.filename, target, +1);
+                            MsgHeader rh = { .command = CMD_ACK, .payload_size = 0 };
+                            send_all(client_socket, &rh, sizeof(rh));
+                        } else {
+                            send_error_to(client_socket, 500, err[0] ? err : "INSERT failed");
+                        }
                         continue;
                     }
-                    // Perform sentence-level replacement under this lock
-                    char err[256] = {0};
-                    // Helper does the actual file rewrite
-                    extern int ss_write_replace_sentence(const char* filename, int sidx, const char* repl, char* errbuf, size_t errlen);
-                    int wrc = ss_write_replace_sentence(req.filename, req.sentence_index, req.replacement, err, sizeof(err));
-                    if (wrc == 0) {
-                        // Return ACK; keep lock held until client sends CMD_WRITE_DONE
-                        MsgHeader rh = { .command = CMD_ACK, .payload_size = 0 };
-                        if (!send_all(client_socket, &rh, sizeof(rh))) {
-                            // client gone; proactively release to avoid dangling lock
-                            sentence_lock_release(req.filename, req.sentence_index);
-                            break;
+
+                    // Case 3: tolerate index drift after insertion by locating lock for this owner
+                    int slot = sentence_lock_find_for_owner(req.filename, client_socket);
+                    if (slot >= 0) {
+                        int owned_idx = -1;
+                        pthread_mutex_lock(&g_sentence_locks_mutex);
+                        owned_idx = g_sentence_locks[slot].sentence_index;
+                        pthread_mutex_unlock(&g_sentence_locks_mutex);
+
+                        if (target == owned_idx) {
+                            int wrc = ss_write_replace_sentence(req.filename, owned_idx, req.replacement, err, sizeof(err));
+                            if (wrc == 0) { MsgHeader rh = (MsgHeader){ .command = CMD_ACK, .payload_size = 0 }; send_all(client_socket, &rh, sizeof(rh)); }
+                            else { send_error_to(client_socket, 500, err[0]?err:"WRITE failed"); }
+                            continue;
                         }
-                    } else {
-                        // On failure, release the lock so client can retry
-                        sentence_lock_release(req.filename, req.sentence_index);
-                        send_error_to(client_socket, 500, err[0] ? err : "WRITE failed");
+                        if (target == owned_idx + 1) {
+                            int wrc = ss_write_insert_sentence(req.filename, target, req.replacement, err, sizeof(err));
+                            if (wrc == 0) { sentence_lock_shift_from(req.filename, target, +1); MsgHeader rh = (MsgHeader){ .command = CMD_ACK, .payload_size = 0 }; send_all(client_socket, &rh, sizeof(rh)); }
+                            else { send_error_to(client_socket, 500, err[0]?err:"INSERT failed"); }
+                            continue;
+                        }
+                        // Enforce bound per requirement: only current (1) or next (2) relative to lock
+                        send_error_to(client_socket, 400, "Sentence index out of bounds for this lock");
+                        continue;
                     }
+
+                    // Otherwise, follow legacy: try to acquire lock for target if free
+                    int locked = (sentence_lock_find(req.filename, target) >= 0);
+                    if (!locked) {
+                        if (sentence_lock_acquire_nowait_owner(req.filename, target, client_socket) != 0) { send_error_to(client_socket, 423, "Sentence is locked"); continue; }
+                        int wrc = ss_write_replace_sentence(req.filename, target, req.replacement, err, sizeof(err));
+                        if (wrc == 0) { MsgHeader rh = { .command = CMD_ACK, .payload_size = 0 }; send_all(client_socket, &rh, sizeof(rh)); }
+                        else { sentence_lock_release(req.filename, target); send_error_to(client_socket, 500, err[0]?err:"WRITE failed"); }
+                        continue;
+                    }
+                    send_error_to(client_socket, 423, "Sentence is locked by another client");
                     continue;
                 }
                 case CMD_WRITE_BEGIN: {
@@ -545,12 +700,18 @@ static void* handle_one_client(void* arg) {
                     if (!recv_all(client_socket, &done, sizeof(done))) {
                         break;
                     }
-                    // Only owner can release
+                    // Only owner can release, but indices may have shifted; try owner-based resolution
                     if (!sentence_lock_owned_by(done.filename, done.sentence_index, client_socket)) {
-                        send_error_to(client_socket, 409, "Not lock owner");
-                        continue;
+                        int slot = sentence_lock_find_for_owner(done.filename, client_socket);
+                        if (slot < 0) { send_error_to(client_socket, 409, "Not lock owner"); continue; }
+                        int idx_to_release;
+                        pthread_mutex_lock(&g_sentence_locks_mutex);
+                        idx_to_release = g_sentence_locks[slot].sentence_index;
+                        pthread_mutex_unlock(&g_sentence_locks_mutex);
+                        sentence_lock_release(done.filename, idx_to_release);
+                    } else {
+                        sentence_lock_release(done.filename, done.sentence_index);
                     }
-                    sentence_lock_release(done.filename, done.sentence_index);
                     MsgHeader rh = { .command = CMD_ACK, .payload_size = 0 };
                     send_all(client_socket, &rh, sizeof(rh));
                     continue;

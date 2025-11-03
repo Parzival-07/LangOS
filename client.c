@@ -393,12 +393,35 @@ int main() {
             } else {
                 printf("[Client] Current sentence is empty.\n");
             }
-            printf("[Client] Enter '<word_index> <content>' (1-based). Use index (current_len+1) to append. Type 'ETIRW' to finish.\n");
+            printf("[Client] Enter '<word_index> <content>' (1-based) to edit words, or:\n");
+            printf("[Client]   'INDEX 1: <sentence>' to replace this sentence\n");
+            printf("[Client]   'INDEX 2: <sentence>' to insert a new sentence after this one\n");
+            printf("[Client] Type 'ETIRW' to finish.\n");
+
+            int sentence_mode = 0; // 0=word-edit, 1=replace(current), 2=insert(after)
+            char* sentence_text = NULL;
             while (1) {
                 printf("WRITE> "); fflush(stdout);
                 char wline[4096]; if (!fgets(wline, sizeof(wline), stdin)) { printf("\n[Client] Input ended.\n"); break; }
                 wline[strcspn(wline, "\n")] = 0;
                 if (strcmp(wline, "ETIRW") == 0) break;
+                // Sentence-level operations: INDEX n: text  (n must be 1 or 2)
+                char wlcopy[4096]; strncpy(wlcopy, wline, sizeof(wlcopy)-1); wlcopy[sizeof(wlcopy)-1] = 0;
+                char* pz = wlcopy; while (*pz==' ') pz++;
+                if (strncasecmp(pz, "INDEX", 5) == 0 || (*pz=='S' || *pz=='s')) {
+                    // advance past keyword if present
+                    if (strncasecmp(pz, "INDEX", 5) == 0) pz += 5; else pz += 1;
+                    while (*pz==' ') pz++;
+                    // parse number possibly followed by ':'
+                    char* ep = pz; long n = strtol(pz, &ep, 10);
+                    while (*ep==' ' || *ep==':') ep++;
+                    if (n != 1 && n != 2) { printf("[Client] Sentence index must be 1 (replace) or 2 (insert-after).\n"); continue; }
+                    if (sentence_text) { free(sentence_text); sentence_text = NULL; }
+                    sentence_text = strdup(ep ? ep : "");
+                    sentence_mode = (int)n;
+                    printf("[Client] Queued sentence %s with text: '%s'\n", (sentence_mode==1?"replacement":"insertion"), sentence_text);
+                    continue;
+                }
                 // parse index and content
                 char* p = wline; while (*p==' ') p++;
                 if (!*p) continue;
@@ -426,9 +449,18 @@ int main() {
                 final_sentence[pos] = '\0';
             }
 
-            // Apply write
-            MsgWriteFile w = (MsgWriteFile){0}; strncpy(w.filename, fname, MAX_FILENAME_LEN - 1); w.sentence_index = sidx;
-            if (final_sentence) { strncpy(w.replacement, final_sentence, sizeof(w.replacement)-1); } else { w.replacement[0] = '\0'; }
+            // Apply write (sentence-level op takes precedence if provided)
+            MsgWriteFile w = (MsgWriteFile){0}; strncpy(w.filename, fname, MAX_FILENAME_LEN - 1);
+            if (sentence_mode == 1 || sentence_mode == 2) {
+                // enforce bounds: only 1 (replace current) or 2 (insert after current)
+                if (sentence_mode == 1) { w.sentence_index = sidx; }
+                else { w.sentence_index = sidx + 1; }
+                const char* st = sentence_text ? sentence_text : "";
+                strncpy(w.replacement, st, sizeof(w.replacement)-1);
+            } else {
+                w.sentence_index = sidx;
+                if (final_sentence) { strncpy(w.replacement, final_sentence, sizeof(w.replacement)-1); } else { w.replacement[0] = '\0'; }
+            }
             MsgHeader wh = { .command = CMD_WRITE_FILE, .payload_size = sizeof(w) };
             if (!send_all(ss_fd, &wh, sizeof(wh)) || !send_all(ss_fd, &w, sizeof(w))) { fprintf(stderr, "[Client] Failed to send WRITE.\n"); }
             MsgHeader wr; if (!recv_all(ss_fd, &wr, sizeof(wr))) { fprintf(stderr, "[Client] No response to WRITE.\n"); }
@@ -446,6 +478,7 @@ int main() {
 
             // Cleanup
             if (final_sentence) free(final_sentence);
+            if (sentence_text) free(sentence_text);
             for (int iw2 = 0; iw2 < wcount; iw2++) free(words[iw2]); if (words) free(words);
             free(sentence);
             close(ss_fd);
