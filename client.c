@@ -703,6 +703,73 @@ int main() {
             // Ensure a trailing newline for cleanliness
             if (flen > 0) printf("\n");
             close(ss_fd);
+        } else if (strcmp(command, "STREAM") == 0) {
+            char* fname = strtok(NULL, " ");
+            if (!fname) { printf("[Client] Usage: STREAM <filename>\n"); continue; }
+
+            // Ask NM for SS address for this file
+            MsgHeader h = (MsgHeader){0};
+            MsgReadFile req = (MsgReadFile){0};
+            h.command = CMD_READ_FILE; h.payload_size = sizeof(req);
+            strncpy(req.filename, fname, MAX_FILENAME_LEN - 1);
+            strncpy(req.requester, username, MAX_USERNAME_LEN - 1);
+            if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &req, sizeof(req))) {
+                fprintf(stderr, "[Client] Failed to send STREAM routing query.\n");
+                continue;
+            }
+            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] NM disconnected.\n"); break; }
+            if (rh.command != CMD_READ_FILE_RESP || rh.payload_size != sizeof(MsgReadFileResponse)) {
+                // Drain unexpected
+                size_t rem = rh.payload_size; char drain[256]; while (rem > 0) { size_t ch = rem>sizeof(drain)?sizeof(drain):rem; if (!recv_all(nm_socket, drain, ch)) break; rem -= ch; }
+                printf("[Client] Unexpected NM response to STREAM routing (%d).\n", rh.command);
+                continue;
+            }
+            MsgReadFileResponse addr = {0}; if (!recv_all(nm_socket, &addr, sizeof(addr))) { fprintf(stderr, "[Client] Failed reading routing payload.\n"); break; }
+            if (!addr.found) { printf("[Client] STREAM failed: file not found.\n"); continue; }
+
+            // Connect to Storage Server
+            int ss_fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (ss_fd < 0) { perror("[Client] socket"); continue; }
+            struct sockaddr_in ss_addr; memset(&ss_addr, 0, sizeof(ss_addr));
+            ss_addr.sin_family = AF_INET; ss_addr.sin_port = htons((uint16_t)addr.ss_port);
+            if (inet_pton(AF_INET, addr.ss_ip, &ss_addr.sin_addr) <= 0) { perror("[Client] inet_pton"); close(ss_fd); continue; }
+            if (connect(ss_fd, (struct sockaddr*)&ss_addr, sizeof(ss_addr)) < 0) { perror("[Client] connect to SS"); close(ss_fd); continue; }
+
+            // Request file via header-based READ (so ACL is enforced)
+            MsgHeader rq = (MsgHeader){ .command = CMD_READ_FILE, .payload_size = sizeof(MsgReadFile) };
+            if (!send_all(ss_fd, &rq, sizeof(rq)) || !send_all(ss_fd, &req, sizeof(req))) { fprintf(stderr, "[Client] STREAM: failed to request file from SS.\n"); close(ss_fd); continue; }
+            MsgHeader rrh; if (!recv_all(ss_fd, &rrh, sizeof(rrh))) { fprintf(stderr, "[Client] STREAM: no READ response from SS.\n"); close(ss_fd); continue; }
+            if (rrh.command == CMD_ERROR && rrh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(ss_fd, &err, sizeof(err)); printf("[Client] STREAM failed (%d): %s\n", err.code, err.message); close(ss_fd); continue; }
+            if (rrh.command != CMD_ACK || rrh.payload_size < 0) { printf("[Client] STREAM: unexpected READ response (%d).\n", rrh.command); close(ss_fd); continue; }
+
+            int fsize = rrh.payload_size;
+            char* filebuf = (char*)malloc((size_t)fsize + 1);
+            if (!filebuf) { fprintf(stderr, "[Client] STREAM: OOM.\n"); close(ss_fd); continue; }
+            if (fsize > 0 && !recv_all(ss_fd, filebuf, (size_t)fsize)) { fprintf(stderr, "[Client] STREAM: failed to receive file data.\n"); free(filebuf); close(ss_fd); continue; }
+            filebuf[fsize] = '\0';
+            close(ss_fd);
+
+            // Stream word-by-word with 0.1s delay
+            char* ctx = NULL;
+            char* p = filebuf;
+            while (*p) {
+                // Skip leading whitespace
+                while (*p && (*p==' ' || *p=='\n' || *p=='\t' || *p=='\r' || *p=='\f' || *p=='\v')) p++;
+                if (!*p) break;
+                // Start of word
+                char* start = p;
+                while (*p && !(*p==' ' || *p=='\n' || *p=='\t' || *p=='\r' || *p=='\f' || *p=='\v')) p++;
+                size_t len = (size_t)(p - start);
+                if (len > 0) {
+                    fwrite(start, 1, len, stdout);
+                    fputc(' ', stdout);
+                    fflush(stdout);
+                    usleep(100000); // 0.1 seconds
+                }
+            }
+            // Finish with newline
+            printf("\n");
+            free(filebuf);
         } else if (strcmp(command, "LIST") == 0) {
             // Request user list from Name Server
             MsgHeader h = (MsgHeader){ .command = CMD_LIST_USERS, .payload_size = 0 };
