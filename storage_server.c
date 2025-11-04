@@ -282,7 +282,7 @@ static int ss_write_replace_sentence_impl(const char* filepath, int sidx, const 
     if (!tf) { free(data); snprintf(errbuf, errlen, "Tmp open failed"); return -1; }
 
     // Walk sentences
-    size_t i = 0, n = rd; int idx = 0; int replaced = 0;
+    size_t i = 0, n = rd; int idx = 0; int replaced = 0; int wrote_any = 0;
     while (i < n) {
         size_t start = i;
         // advance until delimiter or EOF
@@ -294,15 +294,32 @@ static int ss_write_replace_sentence_impl(const char* filepath, int sidx, const 
         }
         size_t end = i; // [start,end)
         if (idx == sidx) {
+            // Write replacement trimmed (avoid accumulating extra spaces)
             size_t rlen = strnlen(repl, 2048);
-            if (rlen > 0) fwrite(repl, 1, rlen, tf);
-            // preserve original trailing whitespace so next sentence stays separated
-            size_t ws_start = end;
-            while (ws_start > start && (data[ws_start-1] == ' ' || data[ws_start-1] == '\n' || data[ws_start-1] == '\t' || data[ws_start-1] == '\r')) ws_start--;
-            if (end > ws_start) fwrite(data + ws_start, 1, end - ws_start, tf);
-            replaced = 1;
+            size_t rstart = 0; while (rstart < rlen && isspace((unsigned char)repl[rstart])) rstart++;
+            size_t rend = rlen; while (rend > rstart && isspace((unsigned char)repl[rend-1])) rend--;
+            // Special case: a single '.' means explicit delete — remove the sentence entirely
+            if (rend == rstart + 1 && repl[rstart] == '.') {
+                // Do not write this sentence or its trailing whitespace
+                // The previous sentence's trailing whitespace (already written) will separate properly
+                replaced = 1;
+            } else {
+                if (rend > rstart) { fwrite(repl + rstart, 1, rend - rstart, tf); wrote_any = 1; }
+                // preserve original trailing whitespace so next sentence stays separated
+                size_t ws_start = end;
+                while (ws_start > start && (data[ws_start-1] == ' ' || data[ws_start-1] == '\n' || data[ws_start-1] == '\t' || data[ws_start-1] == '\r')) ws_start--;
+                if (wrote_any && end > ws_start) fwrite(data + ws_start, 1, end - ws_start, tf);
+                replaced = 1;
+            }
         } else {
-            if (end > start) fwrite(data + start, 1, end - start, tf);
+            if (end > start) {
+                // Avoid leading whitespace at beginning of file after deletions
+                size_t start2 = start;
+                if (!wrote_any) {
+                    while (start2 < end && (data[start2] == ' ' || data[start2] == '\n' || data[start2] == '\t' || data[start2] == '\r')) start2++;
+                }
+                if (end > start2) { fwrite(data + start2, 1, end - start2, tf); wrote_any = 1; }
+            }
         }
         idx++;
     }
@@ -329,16 +346,19 @@ static int ss_write_replace_sentence_impl(const char* filepath, int sidx, const 
             free(data);
             return -1;
         }
-        // Auto-insert a single space between sentences if the existing content
-        // does not end with whitespace (so "One." + "Two." becomes "One. Two.")
-        if (n > 0) {
+        // Append replacement, avoiding extra spaces: add a separator only if
+        // file doesn't end with whitespace AND replacement doesn't start with whitespace
+        size_t rlen = strnlen(repl, 2048);
+        size_t rstart = 0; while (rstart < rlen && isspace((unsigned char)repl[rstart])) rstart++;
+        size_t rend = rlen; while (rend > rstart && isspace((unsigned char)repl[rend-1])) rend--;
+        if (n > 0 && rstart < rend) {
             char last = data[n - 1];
             if (!(last == ' ' || last == '\n' || last == '\t' || last == '\r')) {
-                fputc(' ', tf2);
+                // only add a single space if replacement doesn't already start with whitespace
+                if (!isspace((unsigned char)repl[rstart])) fputc(' ', tf2);
             }
         }
-        size_t rlen = strnlen(repl, 2048);
-        if (rlen > 0) fwrite(repl, 1, rlen, tf2);
+        if (rend > rstart) fwrite(repl + rstart, 1, rend - rstart, tf2);
         fclose(tf2);
         replaced = 1;
         idx++;
@@ -401,7 +421,7 @@ static int ss_write_insert_sentence_impl(const char* filepath, int insert_idx, c
     FILE* tf = fopen(tmppath, "wb");
     if (!tf) { free(data); snprintf(errbuf, errlen, "Tmp open failed"); return -1; }
 
-    size_t i = 0, n = rd; int idx = 0; int inserted = 0;
+    size_t i = 0, n = rd; int idx = 0; int inserted = 0; int wrote_any = 0;
     while (i < n) {
         size_t start = i;
         while (i < n && !parse_is_delim(data[i])) i++;
@@ -416,16 +436,30 @@ static int ss_write_insert_sentence_impl(const char* filepath, int insert_idx, c
             size_t ws_start = end;
             while (ws_start > start && (data[ws_start-1] == ' ' || data[ws_start-1] == '\n' || data[ws_start-1] == '\t' || data[ws_start-1] == '\r')) ws_start--;
             if (ws_start > start) fwrite(data + start, 1, ws_start - start, tf);
-            // one space between previous and inserted
-            fputc(' ', tf);
-            // inserted sentence
-            size_t rlen = strnlen(repl, 2048); if (rlen > 0) fwrite(repl, 1, rlen, tf);
+            // inserted sentence (trimmed), and only add one space between prev and inserted
+            size_t rlen = strnlen(repl, 2048);
+            size_t rstart = 0; while (rstart < rlen && isspace((unsigned char)repl[rstart])) rstart++;
+            size_t rend = rlen; while (rend > rstart && isspace((unsigned char)repl[rend-1])) rend--;
+            if (rstart < rend) {
+                // one space between prev and inserted if inserted doesn't start with whitespace
+                fputc(' ', tf);
+                fwrite(repl + rstart, 1, rend - rstart, tf);
+            } else {
+                // empty insertion still keeps a single space to separate
+                fputc(' ', tf);
+            }
             // original whitespace (between prev and next) now separates inserted and next
             if (end > ws_start) fwrite(data + ws_start, 1, end - ws_start, tf);
             inserted = 1;
         } else {
             // normal write-through
-            if (end > start) fwrite(data + start, 1, end - start, tf);
+            if (end > start) {
+                size_t start2 = start;
+                if (!wrote_any) {
+                    while (start2 < end && (data[start2] == ' ' || data[start2] == '\n' || data[start2] == '\t' || data[start2] == '\r')) start2++;
+                }
+                if (end > start2) { fwrite(data + start2, 1, end - start2, tf); wrote_any = 1; }
+            }
         }
         idx++;
     }
@@ -433,8 +467,14 @@ static int ss_write_insert_sentence_impl(const char* filepath, int insert_idx, c
     if (!inserted) {
         // If inserting at 0 into empty file or at end, just append/precede
         if (insert_idx == 0) {
-            size_t rlen = strnlen(repl, 2048); if (rlen > 0) fwrite(repl, 1, rlen, tf);
-            if (n > 0) fputc(' ', tf);
+            size_t rlen = strnlen(repl, 2048);
+            size_t rstart = 0; while (rstart < rlen && isspace((unsigned char)repl[rstart])) rstart++;
+            size_t rend = rlen; while (rend > rstart && isspace((unsigned char)repl[rend-1])) rend--;
+            if (rend > rstart) fwrite(repl + rstart, 1, rend - rstart, tf);
+            if (n > 0) {
+                // Add separator only if next content doesn't already start with whitespace
+                if (!(data[0] == ' ' || data[0] == '\n' || data[0] == '\t' || data[0] == '\r')) fputc(' ', tf);
+            }
             if (n > 0) fwrite(data, 1, n, tf);
             inserted = 1;
         } else {
@@ -442,12 +482,17 @@ static int ss_write_insert_sentence_impl(const char* filepath, int insert_idx, c
             // Count sentences to see if insert_idx equals idx
             // idx currently equals sentence count
             if (insert_idx == idx) {
-                // ensure separation
-                if (n > 0) {
+                // ensure separation only if needed and replacement doesn't start with whitespace
+                size_t rlen = strnlen(repl, 2048);
+                size_t rstart = 0; while (rstart < rlen && isspace((unsigned char)repl[rstart])) rstart++;
+                size_t rend = rlen; while (rend > rstart && isspace((unsigned char)repl[rend-1])) rend--;
+                if (n > 0 && rstart < rend) {
                     char last = data[n-1];
-                    if (!(last == ' ' || last == '\n' || last == '\t' || last == '\r')) fputc(' ', tf);
+                    if (!(last == ' ' || last == '\n' || last == '\t' || last == '\r')) {
+                        if (!isspace((unsigned char)repl[rstart])) fputc(' ', tf);
+                    }
                 }
-                size_t rlen = strnlen(repl, 2048); if (rlen > 0) fwrite(repl, 1, rlen, tf);
+                if (rend > rstart) fwrite(repl + rstart, 1, rend - rstart, tf);
                 inserted = 1;
             }
         }
@@ -560,6 +605,26 @@ static void* handle_one_client(void* arg) {
                         send_error_to(client_socket, 400, "Invalid filename");
                         continue;
                     }
+                    // ACL check: requester must be owner or in readers/writers
+                    if (req.requester[0] == '\0') { send_error_to(client_socket, 403, "Unauthorized"); continue; }
+                    char meta[512]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", req.filename);
+                    FILE* mf = fopen(meta, "r");
+                    if (!mf) { send_error_to(client_socket, 404, "Not found"); continue; }
+                    char owner[MAX_USERNAME_LEN] = {0};
+                    char readers[1024] = {0}, writers[1024] = {0}; char line2[2048];
+                    while (fgets(line2, sizeof(line2), mf)) {
+                        if (strncmp(line2, "owner:", 6) == 0) { sscanf(line2+6, "%63s", owner); }
+                        else if (strncmp(line2, "readers:", 8) == 0) { strncpy(readers, line2+8, sizeof(readers)-1); }
+                        else if (strncmp(line2, "writers:", 8) == 0) { strncpy(writers, line2+8, sizeof(writers)-1); }
+                    }
+                    fclose(mf);
+                    trim_both(readers); trim_both(writers);
+                    if (!( (owner[0] && strncmp(owner, req.requester, MAX_USERNAME_LEN)==0) ||
+                           list_contains(readers, req.requester) ||
+                           list_contains(writers, req.requester) )) {
+                        send_error_to(client_socket, 403, "Unauthorized");
+                        continue;
+                    }
                     char path[512];
                     snprintf(path, sizeof(path), STORAGE_ROOT "/%s", req.filename);
                     struct stat st;
@@ -598,6 +663,21 @@ static void* handle_one_client(void* arg) {
                     }
                     if (!is_valid_filename(req.filename) || req.sentence_index < 0) {
                         send_error_to(client_socket, 400, "Invalid arguments");
+                        continue;
+                    }
+                    // ACL: requester must be owner or writer
+                    if (req.requester[0] == '\0') { send_error_to(client_socket, 403, "Unauthorized"); continue; }
+                    char meta_w[512]; snprintf(meta_w, sizeof(meta_w), STORAGE_ROOT "/%s.meta", req.filename);
+                    FILE* mf_w = fopen(meta_w, "r"); if (!mf_w) { send_error_to(client_socket, 404, "Not found"); continue; }
+                    char owner_w[MAX_USERNAME_LEN] = {0}; char readers_w[1024] = {0}; char writers_w[1024] = {0}; char linew[2048];
+                    while (fgets(linew, sizeof(linew), mf_w)) {
+                        if (strncmp(linew, "owner:", 6) == 0) { sscanf(linew+6, "%63s", owner_w); }
+                        else if (strncmp(linew, "writers:", 8) == 0) { strncpy(writers_w, linew+8, sizeof(writers_w)-1); }
+                    }
+                    fclose(mf_w);
+                    trim_both(writers_w);
+                    if (!( (owner_w[0] && strncmp(owner_w, req.requester, MAX_USERNAME_LEN)==0) || list_contains(writers_w, req.requester) )) {
+                        send_error_to(client_socket, 403, "Write access denied");
                         continue;
                     }
                     // Determine operation type: replacement of owned index OR insertion after owned index.
@@ -684,6 +764,21 @@ static void* handle_one_client(void* arg) {
                         send_error_to(client_socket, 400, "Invalid arguments");
                         continue;
                     }
+                    // ACL: owner or writer required to acquire lock
+                    if (req.requester[0] == '\0') { send_error_to(client_socket, 403, "Unauthorized"); continue; }
+                    char meta_b[512]; snprintf(meta_b, sizeof(meta_b), STORAGE_ROOT "/%s.meta", req.filename);
+                    FILE* mf_b = fopen(meta_b, "r"); if (!mf_b) { send_error_to(client_socket, 404, "Not found"); continue; }
+                    char owner_b[MAX_USERNAME_LEN] = {0}; char writers_b[1024] = {0}; char lineb[2048];
+                    while (fgets(lineb, sizeof(lineb), mf_b)) {
+                        if (strncmp(lineb, "owner:", 6) == 0) { sscanf(lineb+6, "%63s", owner_b); }
+                        else if (strncmp(lineb, "writers:", 8) == 0) { strncpy(writers_b, lineb+8, sizeof(writers_b)-1); }
+                    }
+                    fclose(mf_b);
+                    trim_both(writers_b);
+                    if (!( (owner_b[0] && strncmp(owner_b, req.requester, MAX_USERNAME_LEN)==0) || list_contains(writers_b, req.requester) )) {
+                        send_error_to(client_socket, 403, "Write access denied");
+                        continue;
+                    }
                     if (sentence_lock_acquire_nowait_owner(req.filename, req.sentence_index, client_socket) != 0) {
                         send_error_to(client_socket, 423, "Sentence is locked");
                         continue;
@@ -704,6 +799,7 @@ static void* handle_one_client(void* arg) {
                     if (!recv_all(client_socket, &done, sizeof(done))) {
                         break;
                     }
+                    // Optional ACL check: only owner/writer allowed to release, but main guard is lock ownership.
                     // Only owner can release, but indices may have shifted; try owner-based resolution
                     if (!sentence_lock_owned_by(done.filename, done.sentence_index, client_socket)) {
                         int slot = sentence_lock_find_for_owner(done.filename, client_socket);
@@ -730,34 +826,46 @@ static void* handle_one_client(void* arg) {
             }
         }
     } else {
-        // Legacy simple protocol: read a filename line, send content, then close
-        char fname[MAX_FILENAME_LEN+2];
+        // Legacy/simple protocol (now ACL-aware): read two lines: username and filename
+        char user[MAX_USERNAME_LEN+2] = {0};
+        char fname[MAX_FILENAME_LEN+2] = {0};
+        size_t upos = 0;
+        while (upos < sizeof(user)-1) {
+            char ch; ssize_t r = recv(client_socket, &ch, 1, 0); if (r <= 0) break; if (ch == '\n') break; user[upos++] = ch;
+        }
         size_t fpos = 0;
         while (fpos < sizeof(fname)-1) {
-            char ch;
-            ssize_t r = recv(client_socket, &ch, 1, 0);
-            if (r <= 0) break; // disconnect or error
-            if (ch == '\n') break;
-            fname[fpos++] = ch;
+            char ch; ssize_t r = recv(client_socket, &ch, 1, 0); if (r <= 0) break; if (ch == '\n') break; fname[fpos++] = ch;
         }
-        fname[fpos] = '\0';
-
-        if (fpos == 0 || !is_valid_filename(fname)) {
-            const char* msg = "ERROR: invalid filename\n";
-            send_all(client_socket, msg, strlen(msg));
-            close(client_socket);
-            return NULL;
+        if (fpos == 0) {
+            // Backward compat: treat first line as filename, deny due to missing user
+            strncpy(fname, user, sizeof(fname)-1); user[0] = '\0';
+        }
+        if (!is_valid_filename(fname)) {
+            const char* msg = "ERROR: invalid filename\n"; send_all(client_socket, msg, strlen(msg)); close(client_socket); return NULL;
         }
 
-        char path[512];
-        snprintf(path, sizeof(path), STORAGE_ROOT "/%s", fname);
+        // ACL check from meta
+        int allowed = 0;
+        char meta[512]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", fname);
+        FILE* mf = fopen(meta, "r");
+        if (mf) {
+            char owner[MAX_USERNAME_LEN] = {0}; char readers[1024] = {0}; char writers[1024] = {0}; char line[2048];
+            while (fgets(line, sizeof(line), mf)) {
+                if (strncmp(line, "owner:", 6) == 0) { sscanf(line+6, "%63s", owner); }
+                else if (strncmp(line, "readers:", 8) == 0) { strncpy(readers, line+8, sizeof(readers)-1); }
+                else if (strncmp(line, "writers:", 8) == 0) { strncpy(writers, line+8, sizeof(writers)-1); }
+            }
+            fclose(mf);
+            trim_both(readers); trim_both(writers);
+            if (owner[0] && user[0] && strncmp(owner, user, MAX_USERNAME_LEN)==0) allowed = 1;
+            else if (user[0] && (list_contains(readers, user) || list_contains(writers, user))) allowed = 1;
+        }
+        if (!allowed) { const char* msg = "ERROR: unauthorized"; send_all(client_socket, msg, strlen(msg)); close(client_socket); return NULL; }
+
+        char path[512]; snprintf(path, sizeof(path), STORAGE_ROOT "/%s", fname);
         FILE* f = fopen(path, "rb");
-        if (!f) {
-            const char* msg = "ERROR: not found\n";
-            send_all(client_socket, msg, strlen(msg));
-            close(client_socket);
-            return NULL;
-        }
+        if (!f) { const char* msg = "ERROR: not found\n"; send_all(client_socket, msg, strlen(msg)); close(client_socket); return NULL; }
         char buf[4096];
         size_t nread;
         while ((nread = fread(buf, 1, sizeof(buf), f)) > 0) {
@@ -933,6 +1041,19 @@ void* listen_to_nm(void* arg) {
                     nm_send_error(400, "Payload read failed");
                     break;
                 }
+                // Enforce owner-only delete
+                char meta[512]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", msg.filename);
+                FILE* mf = fopen(meta, "r");
+                if (!mf) { nm_send_error(404, "File not found"); break; }
+                char owner[MAX_USERNAME_LEN] = {0}; char line[1024];
+                while (fgets(line, sizeof(line), mf)) {
+                    if (strncmp(line, "owner:", 6) == 0) { sscanf(line+6, "%63s", owner); break; }
+                }
+                fclose(mf);
+                if (!(owner[0] && msg.requester[0] && strncmp(owner, msg.requester, MAX_USERNAME_LEN)==0)) {
+                    nm_send_error(403, "Only owner can delete");
+                    break;
+                }
                 int rc = ss_delete_file_do(msg.filename);
                 if (rc == 0) {
                     printf("[SS] Deleted file '%s'\n", msg.filename);
@@ -1033,19 +1154,46 @@ void* listen_to_nm(void* arg) {
                 // Trim leading and trailing whitespace
                 trim_both(readers);
                 trim_both(writers);
+                // Gather file stats and counts
+                char path[512]; snprintf(path, sizeof(path), STORAGE_ROOT "/%s", req.filename);
+                struct stat st; memset(&st, 0, sizeof(st)); int have_stat = (stat(path, &st) == 0);
+                long long size_bytes = have_stat ? (long long)st.st_size : 0;
+                long long last_access = have_stat ? (long long)st.st_atime : 0;
+                // Count words and chars
+                long long chars_cnt = 0, words_cnt = 0;
+                FILE* f = fopen(path, "rb");
+                if (f) {
+                    int in_word = 0; int c;
+                    while ((c = fgetc(f)) != EOF) {
+                        chars_cnt++;
+                        if (c==' '||c=='\n'||c=='\t'||c=='\r'||c=='\f'||c=='\v') { if (in_word) { words_cnt++; in_word = 0; } }
+                        else { in_word = 1; }
+                    }
+                    if (in_word) words_cnt++;
+                    fclose(f);
+                }
                 // Build info string
                 MsgInfoResponse resp = {0};
                 char created_buf[64]={0}, updated_buf[64]={0};
-                time_t cr=(time_t)created, up=(time_t)updated;
+                char access_buf[64]={0}, mod_buf[64]={0};
+                long long last_modified = have_stat ? (long long)st.st_mtime : 0;
+                time_t cr=(time_t)created, up=(time_t)updated, ac=(time_t)last_access, mo=(time_t)last_modified;
                 struct tm tmv;
                 if (localtime_r(&cr, &tmv)) strftime(created_buf, sizeof(created_buf), "%Y-%m-%d %H:%M:%S", &tmv);
                 if (localtime_r(&up, &tmv)) strftime(updated_buf, sizeof(updated_buf), "%Y-%m-%d %H:%M:%S", &tmv);
+                if (localtime_r(&ac, &tmv)) strftime(access_buf, sizeof(access_buf), "%Y-%m-%d %H:%M:%S", &tmv);
+                if (localtime_r(&mo, &tmv)) strftime(mod_buf, sizeof(mod_buf), "%Y-%m-%d %H:%M:%S", &tmv);
                 snprintf(resp.info, sizeof(resp.info),
-                         "filename: %s\nowner: %s\ncreated: %s (%lld)\nupdated: %s (%lld)\nreaders: %s\nwriters: %s\n",
+                         "filename: %s\nowner: %s\ncreated: %s (%lld)\nupdated: %s (%lld)\nsize: %lld\nwords: %lld\nchars: %lld\nlast_access: %s (%lld)\nlast_modified: %s (%lld)\nreaders: %s\nwriters: %s\n",
                          req.filename,
                          owner[0]?owner:"",
                          created_buf[0]?created_buf:"", created,
                          updated_buf[0]?updated_buf:"", updated,
+                         size_bytes,
+                         words_cnt,
+                         chars_cnt,
+                         access_buf[0]?access_buf:"", last_access,
+                         mod_buf[0]?mod_buf:"", last_modified,
                          readers[0]?readers:"",
                          writers[0]?writers:"");
                 MsgHeader h = { .command = CMD_INFO_RESP, .payload_size = sizeof(resp) };

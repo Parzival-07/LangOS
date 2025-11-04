@@ -58,6 +58,16 @@ void remove_newline(char* str) {
     str[strcspn(str, "\n")] = 0;
 }
 
+// Portable strdup to avoid missing prototype issues on some platforms
+static char* safe_strdup(const char* s) {
+    if (!s) return NULL;
+    size_t n = strlen(s) + 1;
+    char* p = (char*)malloc(n);
+    if (!p) return NULL;
+    memcpy(p, s, n);
+    return p;
+}
+
 int main() {
     // --- Get Username ---
     printf("Enter your username: ");
@@ -201,6 +211,8 @@ int main() {
             h.command = CMD_DELETE_FILE;
             h.payload_size = sizeof(MsgDeleteFile);
             strncpy(payload.filename, fname, MAX_FILENAME_LEN - 1);
+            // requester will be set by NM; we can set it here for completeness
+            strncpy(payload.requester, username, MAX_USERNAME_LEN - 1);
 
             if (!send_all(nm_socket, &h, sizeof(h)) ||
                 !send_all(nm_socket, &payload, sizeof(payload))) {
@@ -229,12 +241,27 @@ int main() {
                 printf("[Client] Unexpected response (%d).\n", rh.command);
             }
         } else if (strcmp(command, "VIEW") == 0) {
-            // Request a view of all files from NM
+            // VIEW flags: -a (all), -l (long listing). Accept combinations: -a, -l, -al, -la
+            int show_all = 0, long_list = 0;
+            char* flag = strtok(NULL, " ");
+            if (flag) {
+                if (strcmp(flag, "-a") == 0) { show_all = 1; }
+                else if (strcmp(flag, "-l") == 0) { long_list = 1; }
+                else if (strcmp(flag, "-al") == 0 || strcmp(flag, "-la") == 0) { show_all = 1; long_list = 1; }
+                else {
+                    printf("[Client] Usage: VIEW [-a|-l|-al]\n");
+                }
+            }
+
+            MsgViewFilesRequest rq = {0};
+            rq.show_all = show_all;
+            rq.long_list = long_list;
+            strncpy(rq.requester, username, MAX_USERNAME_LEN - 1);
             MsgHeader h = {0};
             h.command = CMD_VIEW_FILES;
-            h.payload_size = 0; // no payload
+            h.payload_size = sizeof(rq);
 
-            if (!send_all(nm_socket, &h, sizeof(h))) {
+            if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &rq, sizeof(rq))) {
                 fprintf(stderr, "[Client] Failed to send VIEW to NM.\n");
                 continue;
             }
@@ -291,6 +318,7 @@ int main() {
             h.command = CMD_READ_FILE;
             h.payload_size = sizeof(req);
             strncpy(req.filename, fname, MAX_FILENAME_LEN - 1);
+            strncpy(req.requester, username, MAX_USERNAME_LEN - 1);
             if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &req, sizeof(req))) {
                 fprintf(stderr, "[Client] Failed to query NM for file location.\n");
                 continue;
@@ -317,7 +345,7 @@ int main() {
             if (connect(ss_fd, (struct sockaddr*)&ss_addr, sizeof(ss_addr)) < 0) { perror("[Client] connect SS"); close(ss_fd); continue; }
 
             // Acquire lock: CMD_WRITE_BEGIN
-            MsgWriteBegin begin = (MsgWriteBegin){0}; strncpy(begin.filename, fname, MAX_FILENAME_LEN - 1); begin.sentence_index = sidx;
+            MsgWriteBegin begin = (MsgWriteBegin){0}; strncpy(begin.filename, fname, MAX_FILENAME_LEN - 1); begin.sentence_index = sidx; strncpy(begin.requester, username, MAX_USERNAME_LEN - 1);
             MsgHeader bh = { .command = CMD_WRITE_BEGIN, .payload_size = sizeof(begin) };
             if (!send_all(ss_fd, &bh, sizeof(bh)) || !send_all(ss_fd, &begin, sizeof(begin))) { fprintf(stderr, "[Client] Failed to send WRITE_BEGIN.\n"); close(ss_fd); continue; }
             MsgHeader brh; if (!recv_all(ss_fd, &brh, sizeof(brh))) { fprintf(stderr, "[Client] No response for WRITE_BEGIN.\n"); close(ss_fd); continue; }
@@ -330,7 +358,7 @@ int main() {
             }
 
             // Fetch file content via header-based READ to build the working sentence
-            MsgHeader rqh = { .command = CMD_READ_FILE, .payload_size = sizeof(MsgReadFile) };
+            MsgHeader rqh = (MsgHeader){ .command = CMD_READ_FILE, .payload_size = sizeof(MsgReadFile) };
             if (!send_all(ss_fd, &rqh, sizeof(rqh)) || !send_all(ss_fd, &req, sizeof(req))) { fprintf(stderr, "[Client] Failed to request file from SS.\n"); close(ss_fd); continue; }
             MsgHeader rrh; if (!recv_all(ss_fd, &rrh, sizeof(rrh))) { fprintf(stderr, "[Client] No READ response from SS.\n"); close(ss_fd); continue; }
             if (rrh.command == CMD_ERROR && rrh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(ss_fd, &err, sizeof(err)); printf("[Client] READ failed (%d): %s\n", err.code, err.message); close(ss_fd); continue; }
@@ -374,12 +402,14 @@ int main() {
 
             // Tokenize by spaces (simple)
             char** words = NULL; int wcount = 0; size_t cap = 0;
-            char* tokbuf = strdup(sentence);
+            char* tokbuf = safe_strdup(sentence);
             if (!tokbuf) { fprintf(stderr, "[Client] OOM.\n"); free(sentence); close(ss_fd); continue; }
             char* saveptr = NULL; char* t = strtok_r(tokbuf, " \t\r\n", &saveptr);
             while (t) {
                 if (wcount == (int)cap) { cap = cap ? cap*2 : 8; char** nw = realloc(words, cap * sizeof(char*)); if (!nw) { fprintf(stderr, "[Client] OOM.\n"); break; } words = nw; }
-                words[wcount++] = strdup(t);
+                char* dup = safe_strdup(t);
+                if (!dup) { fprintf(stderr, "[Client] OOM.\n"); break; }
+                words[wcount++] = dup;
                 t = strtok_r(NULL, " \t\r\n", &saveptr);
             }
             free(tokbuf);
@@ -418,7 +448,7 @@ int main() {
                     while (*ep==' ' || *ep==':') ep++;
                     if (n != 1 && n != 2) { printf("[Client] Sentence index must be 1 (replace) or 2 (insert-after).\n"); continue; }
                     if (sentence_text) { free(sentence_text); sentence_text = NULL; }
-                    sentence_text = strdup(ep ? ep : "");
+                    sentence_text = safe_strdup(ep ? ep : "");
                     sentence_mode = (int)n;
                     printf("[Client] Queued sentence %s with text: '%s'\n", (sentence_mode==1?"replacement":"insertion"), sentence_text);
                     continue;
@@ -432,7 +462,7 @@ int main() {
                 char* content = endptr; if (!content) content = "";
                 if (idx1 != 1 && idx1 != 2) { printf("[Client] Only sentence indices 1 (replace) or 2 (insert-after) are allowed.\n"); continue; }
                 if (sentence_text) { free(sentence_text); sentence_text = NULL; }
-                sentence_text = strdup(content);
+                sentence_text = safe_strdup(content);
                 sentence_mode = (int)idx1;
                 printf("[Client] Queued sentence %s with text: '%s'\n", (sentence_mode==1?"replacement":"insertion"), sentence_text);
                 continue;
@@ -441,8 +471,30 @@ int main() {
             // No word-level editing output is used; we operate at sentence level only.
             char* final_sentence = NULL; // unused unless we fall back; kept for cleanup path
 
+            // If user made no changes, cancel without modifying the file
+            if (sentence_mode == 0 && (!sentence_text || sentence_text[0] == '\0')) {
+                printf("[Client] No changes; canceling WRITE.\n");
+                // Release lock cleanly
+                MsgWriteDone cancel = (MsgWriteDone){0};
+                strncpy(cancel.filename, fname, MAX_FILENAME_LEN - 1);
+                cancel.sentence_index = sidx;
+                strncpy(cancel.requester, username, MAX_USERNAME_LEN - 1);
+                MsgHeader ch = { .command = CMD_WRITE_DONE, .payload_size = sizeof(cancel) };
+                send_all(ss_fd, &ch, sizeof(ch));
+                send_all(ss_fd, &cancel, sizeof(cancel));
+                // best-effort read of response
+                MsgHeader crh; recv_all(ss_fd, &crh, sizeof(crh));
+                // Cleanup and exit
+                for (int iw2 = 0; iw2 < wcount; iw2++) free(words[iw2]); if (words) free(words);
+                free(sentence);
+                if (final_sentence) free(final_sentence);
+                if (sentence_text) free(sentence_text);
+                close(ss_fd);
+                continue;
+            }
+
             // Apply write (sentence-level op takes precedence if provided)
-            MsgWriteFile w = (MsgWriteFile){0}; strncpy(w.filename, fname, MAX_FILENAME_LEN - 1);
+            MsgWriteFile w = (MsgWriteFile){0}; strncpy(w.filename, fname, MAX_FILENAME_LEN - 1); strncpy(w.requester, username, MAX_USERNAME_LEN - 1);
             if (sentence_mode == 1 || sentence_mode == 2) {
                 // enforce bounds: only 1 (replace current) or 2 (insert after current)
                 if (sentence_mode == 1) { w.sentence_index = sidx; }
@@ -461,7 +513,7 @@ int main() {
             else { printf("[Client] WRITE applied.\n"); }
 
             // Release lock
-            MsgWriteDone done = (MsgWriteDone){0}; strncpy(done.filename, fname, MAX_FILENAME_LEN - 1); done.sentence_index = sidx;
+            MsgWriteDone done = (MsgWriteDone){0}; strncpy(done.filename, fname, MAX_FILENAME_LEN - 1); done.sentence_index = sidx; strncpy(done.requester, username, MAX_USERNAME_LEN - 1);
             MsgHeader dh = { .command = CMD_WRITE_DONE, .payload_size = sizeof(done) };
             send_all(ss_fd, &dh, sizeof(dh)); send_all(ss_fd, &done, sizeof(done));
             MsgHeader drh; if (recv_all(ss_fd, &drh, sizeof(drh))) {
@@ -475,18 +527,35 @@ int main() {
             free(sentence);
             close(ss_fd);
         } else if (strcmp(command, "ADDACCESS") == 0) {
-            char* fname = strtok(NULL, " ");
-            char* target = strtok(NULL, " ");
-            char* mode = strtok(NULL, " "); // R or W
-            if (!fname || !target || !mode || !(mode[0]=='R' || mode[0]=='W')) {
-                printf("[Client] Usage: ADDACCESS <filename> <username> <R|W>\n");
+            // Spec: ADDACCESS -R|-W <filename> <username>
+            // Backward compat: ADDACCESS <filename> <username> <R|W>
+            char* flag = strtok(NULL, " ");
+            char* fname = NULL; char* target = NULL; int is_writer = -1;
+            if (flag && flag[0] == '-') {
+                // New spec ordering
+                if (strcasecmp(flag, "-R") == 0) is_writer = 0;
+                else if (strcasecmp(flag, "-W") == 0) is_writer = 1;
+                fname = strtok(NULL, " ");
+                target = strtok(NULL, " ");
+            } else {
+                // Legacy ordering
+                fname = flag;
+                target = strtok(NULL, " ");
+                char* mode = strtok(NULL, " ");
+                if (mode) {
+                    if (mode[0]=='R' || mode[0]=='r') is_writer = 0;
+                    else if (mode[0]=='W' || mode[0]=='w') is_writer = 1;
+                }
+            }
+            if (!fname || !target || !(is_writer==0 || is_writer==1)) {
+                printf("[Client] Usage: ADDACCESS -R|-W <filename> <username>\n");
                 continue;
             }
             MsgAccessChange ac = (MsgAccessChange){0};
             strncpy(ac.filename, fname, MAX_FILENAME_LEN-1);
             strncpy(ac.target, target, MAX_USERNAME_LEN-1);
             strncpy(ac.requester, username, MAX_USERNAME_LEN-1);
-            ac.is_writer = (mode[0] == 'W');
+            ac.is_writer = is_writer;
             MsgHeader h = { .command = CMD_ADD_ACCESS, .payload_size = sizeof(ac) };
             if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &ac, sizeof(ac))) {
                 fprintf(stderr, "[Client] Failed to send ADDACCESS.\n");
@@ -497,12 +566,10 @@ int main() {
             else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(nm_socket, &err, sizeof(err)); printf("[Client] ADDACCESS failed (%d): %s\n", err.code, err.message); }
             else printf("[Client] Unexpected response (%d).\n", rh.command);
         } else if (strcmp(command, "REMACCESS") == 0) {
+            // Spec: REMACCESS <filename> <username>
             char* fname = strtok(NULL, " ");
             char* target = strtok(NULL, " ");
-            if (!fname || !target) {
-                printf("[Client] Usage: REMACCESS <filename> <username>\n");
-                continue;
-            }
+            if (!fname || !target) { printf("[Client] Usage: REMACCESS <filename> <username>\n"); continue; }
             MsgAccessChange ac = (MsgAccessChange){0};
             strncpy(ac.filename, fname, MAX_FILENAME_LEN-1);
             strncpy(ac.target, target, MAX_USERNAME_LEN-1);
@@ -545,11 +612,12 @@ int main() {
             }
 
             // Ask NM for SS address owning this file
-            MsgHeader h = {0};
-            MsgReadFile req = {0};
+            MsgHeader h = (MsgHeader){0};
+            MsgReadFile req = (MsgReadFile){0};
             h.command = CMD_READ_FILE;
             h.payload_size = sizeof(req);
             strncpy(req.filename, fname, MAX_FILENAME_LEN - 1);
+            strncpy(req.requester, username, MAX_USERNAME_LEN - 1);
 
             if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &req, sizeof(req))) {
                 fprintf(stderr, "[Client] Failed to send READ to NM.\n");
@@ -592,9 +660,11 @@ int main() {
                 perror("[Client] connect to SS"); close(ss_fd); continue;
             }
 
-            // Send filename followed by newline (simple direct protocol)
+            // Send username and filename on two lines for ACL-aware simple protocol
+            size_t ulen = strnlen(username, MAX_USERNAME_LEN);
             size_t flen = strnlen(fname, MAX_FILENAME_LEN);
-            if (!send_all(ss_fd, fname, flen) || !send_all(ss_fd, "\n", 1)) {
+            if (!send_all(ss_fd, username, ulen) || !send_all(ss_fd, "\n", 1) ||
+                !send_all(ss_fd, fname, flen) || !send_all(ss_fd, "\n", 1)) {
                 fprintf(stderr, "[Client] Failed to send filename to SS.\n");
                 close(ss_fd); continue;
             }

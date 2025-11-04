@@ -29,6 +29,8 @@ typedef struct {
 
     // SS-specific data
     int client_port; // Port clients should use to connect to this SS
+    // Serialize NM<->SS request/response to avoid interleaved replies
+    pthread_mutex_t ss_io_mutex;
     
 } ConnectionInfo;
 
@@ -267,96 +269,189 @@ void* handle_connection(void* arg) {
                 continue;
             }
 
-            // Forward to SS
-            int ss_sock = connections[ss_slot].socket;
+            // Forward to SS with per-SS serialization
+            int ss_sock;
+            pthread_mutex_lock(&connections_mutex);
+            ss_sock = connections[ss_slot].socket;
+            pthread_mutex_unlock(&connections_mutex);
             printf("[NM] Forwarding CREATE '%s' (owner=%s) to SS at %s:%d (Slot %d)\n",
                    payload.filename, payload.owner, connections[ss_slot].ip_addr, connections[ss_slot].client_port, ss_slot);
 
-            MsgHeader fwd = {0};
-            fwd.command = CMD_CREATE_FILE;
-            fwd.payload_size = sizeof(MsgCreateFile);
-            if (!send_all(ss_sock, &fwd, sizeof(fwd)) ||
-                !send_all(ss_sock, &payload, sizeof(payload))) {
-                send_error(socket, 502, "Failed to contact Storage Server");
-                continue;
-            }
-
-            // Receive SS response here and proxy it back to the client
+            pthread_mutex_lock(&connections[ss_slot].ss_io_mutex);
             MsgHeader ss_resp;
-            if (!recv_all(ss_sock, &ss_resp, sizeof(ss_resp))) {
-                send_error(socket, 502, "No response from Storage Server");
-                continue;
-            }
-
-            // If SS acknowledged creation, update NM registry before proxying
-            if (ss_resp.command == CMD_ACK) {
-                registry_add_file_if_absent(payload.filename, payload.owner, ss_slot);
-            }
-
-            // Send header to client
-            if (!send_all(socket, &ss_resp, sizeof(ss_resp))) {
-                // Client disconnected
-                continue;
-            }
-
-            // Forward payload in full (if any)
-            size_t remaining = ss_resp.payload_size;
-            char buf[4096];
-            while (remaining > 0) {
-                size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
-                if (!recv_all(ss_sock, buf, chunk)) {
-                    send_error(socket, 502, "Failed to read SS payload");
-                    break;
+            do {
+                MsgHeader fwd = {0};
+                fwd.command = CMD_CREATE_FILE;
+                fwd.payload_size = sizeof(MsgCreateFile);
+                if (!send_all(ss_sock, &fwd, sizeof(fwd)) ||
+                    !send_all(ss_sock, &payload, sizeof(payload))) {
+                    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                    send_error(socket, 502, "Failed to contact Storage Server");
+                    continue;
                 }
-                if (!send_all(socket, buf, chunk)) {
-                    break;
+
+                // Receive SS response here and proxy it back to the client
+                if (!recv_all(ss_sock, &ss_resp, sizeof(ss_resp))) {
+                    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                    send_error(socket, 502, "No response from Storage Server");
+                    continue;
                 }
-                remaining -= chunk;
-            }
+                // If SS acknowledged creation, update NM registry before proxying
+                if (ss_resp.command == CMD_ACK) {
+                    registry_add_file_if_absent(payload.filename, payload.owner, ss_slot);
+                }
+
+                // Send header to client
+                if (!send_all(socket, &ss_resp, sizeof(ss_resp))) {
+                    // Client disconnected
+                    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                    continue;
+                }
+
+                // Forward payload in full (if any) while holding SS lock
+                size_t remaining = ss_resp.payload_size;
+                char buf[4096];
+                while (remaining > 0) {
+                    size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+                    if (!recv_all(ss_sock, buf, chunk)) {
+                        pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                        send_error(socket, 502, "Failed to read SS payload");
+                        break;
+                    }
+                    if (!send_all(socket, buf, chunk)) {
+                        break;
+                    }
+                    remaining -= chunk;
+                }
+            } while (0);
+            pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
             continue;
         } else if (header.command == CMD_VIEW_FILES && connections[slot].type == CONN_TYPE_CLIENT) {
             // Before serving VIEW, refresh registry from connected SS to prune stale entries
             registry_refresh_from_ss();
-            // No payload expected for simple VIEW
-            if (header.payload_size != 0) {
-                // Drain any unexpected payload
-                char drain[1024];
-                size_t remaining = header.payload_size;
-                while (remaining > 0) {
-                    size_t chunk = remaining > sizeof(drain) ? sizeof(drain) : remaining;
-                    if (!recv_all(socket, drain, chunk)) break;
-                    remaining -= chunk;
-                }
-            }
 
-            // Build newline-separated list
-            char buffer[16384];
-            buffer[0] = '\0';
-            size_t pos = 0, cap = sizeof(buffer);
+            // Expect a MsgViewFilesRequest payload
+            if (header.payload_size != sizeof(MsgViewFilesRequest)) {
+                // Drain unexpected payload
+                size_t rem = header.payload_size; char drain[512];
+                while (rem > 0) { size_t chunk = rem > sizeof(drain)?sizeof(drain):rem; if (!recv_all(socket, drain, chunk)) break; rem -= chunk; }
+                send_error(socket, 400, "Bad payload size");
+                continue;
+            }
+            MsgViewFilesRequest vreq = {0};
+            if (!recv_all(socket, &vreq, sizeof(vreq))) { send_error(socket, 400, "Payload read failed"); continue; }
+            // Use authenticated username regardless of payload
+            char requester[MAX_USERNAME_LEN] = {0};
+            strncpy(requester, connections[slot].username, MAX_USERNAME_LEN-1);
+
+            // Build result
+            char buffer[16384]; buffer[0] = '\0'; size_t pos = 0, cap = sizeof(buffer);
 
             pthread_mutex_lock(&file_registry_mutex);
             for (int i = 0; i < file_count; i++) {
-                int n = snprintf(buffer + pos, (pos < cap ? cap - pos : 0), "%s\n", file_registry[i].filename);
-                if (n <= 0) break;
-                if ((size_t)n >= (cap - pos)) { // truncated; stop
-                    pos = cap - 1;
-                    break;
+                const char* fname = file_registry[i].filename;
+                int ss_slot = file_registry[i].ss_slot;
+                int include = 1; // default include for -a
+                char linebuf[2048] = {0};
+
+                if (!vreq.show_all) {
+                    // Query SS for INFO and check ACL locally
+                    include = 0;
                 }
-                pos += (size_t)n;
+
+                // Always fetch INFO if long_list or need to check access
+                MsgInfoResponse info = {0};
+                int have_info = 0;
+                if (vreq.long_list || !vreq.show_all) {
+                    pthread_mutex_lock(&connections_mutex);
+                    int valid = (ss_slot >= 0 && connections[ss_slot].type == CONN_TYPE_SS && connections[ss_slot].socket >= 0);
+                    int ss_sock_local = valid ? connections[ss_slot].socket : -1;
+                    pthread_mutex_unlock(&connections_mutex);
+                    if (valid) {
+                        pthread_mutex_lock(&connections[ss_slot].ss_io_mutex);
+                        MsgHeader ih = { .command = CMD_INFO, .payload_size = sizeof(MsgInfoRequest) };
+                        MsgInfoRequest ir = {0}; strncpy(ir.filename, fname, MAX_FILENAME_LEN-1);
+                        if (send_all(ss_sock_local, &ih, sizeof(ih)) && send_all(ss_sock_local, &ir, sizeof(ir))) {
+                            MsgHeader rh; if (recv_all(ss_sock_local, &rh, sizeof(rh))) {
+                                if (rh.command == CMD_INFO_RESP && rh.payload_size == sizeof(MsgInfoResponse)) {
+                                    if (recv_all(ss_sock_local, &info, sizeof(info))) { have_info = 1; }
+                                } else {
+                                    // Drain unexpected
+                                    size_t rem = rh.payload_size; char drain[512]; while (rem > 0) { size_t ch = rem>sizeof(drain)?sizeof(drain):rem; if (!recv_all(ss_sock_local, drain, ch)) break; rem -= ch; }
+                                }
+                            }
+                        }
+                        pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                    }
+                }
+
+                if (!vreq.show_all) {
+                    if (have_info) {
+                        // Parse owner/readers/writers from info.info
+                        char owner[MAX_USERNAME_LEN] = {0};
+                        char readers[1024] = {0};
+                        char writers[1024] = {0};
+                        // Simple parse
+                        const char* p = info.info;
+                        while (*p) {
+                            const char* nl = strchr(p, '\n'); size_t len = nl ? (size_t)(nl - p) : strlen(p);
+                            if (len >= 6 && strncmp(p, "owner:", 6) == 0) { sscanf(p+6, "%63s", owner); }
+                            else if (len >= 8 && strncmp(p, "readers:", 8) == 0) { strncpy(readers, p+8, sizeof(readers)-1); }
+                            else if (len >= 8 && strncmp(p, "writers:", 8) == 0) { strncpy(writers, p+8, sizeof(writers)-1); }
+                            if (!nl) break; p = nl + 1;
+                        }
+                        // Trim whitespace from readers/writers simple way
+                        // Check access: owner or listed in readers/writers
+                        int allowed = 0;
+                        if (owner[0] && strncmp(owner, requester, MAX_USERNAME_LEN)==0) allowed = 1;
+                        // tokenize by space/comma
+                        if (!allowed) {
+                            char tmp[1024]; strncpy(tmp, readers, sizeof(tmp)-1); tmp[sizeof(tmp)-1]=0; char* ctx=NULL; char* t=strtok_r(tmp, ", \t\r\n", &ctx); while(t){ if(strcmp(t, requester)==0){allowed=1; break;} t=strtok_r(NULL, ", \t\r\n", &ctx);} }
+                        if (!allowed) {
+                            char tmp2[1024]; strncpy(tmp2, writers, sizeof(tmp2)-1); tmp2[sizeof(tmp2)-1]=0; char* ctx2=NULL; char* t2=strtok_r(tmp2, ", \t\r\n", &ctx2); while(t2){ if(strcmp(t2, requester)==0){allowed=1; break;} t2=strtok_r(NULL, ", \t\r\n", &ctx2);} }
+                        include = allowed;
+                    } else {
+                        include = 0; // no info -> cannot validate access
+                    }
+                }
+
+                if (!include) continue;
+
+                if (vreq.long_list && have_info) {
+                    // Include condensed one-line details: owner, size, words, chars, last_access
+                    // Extract fields from info.info
+                    char owner[128]="", size[64]="", words[64]="", chars[64]="", last[128]="", lastmod[128]="";
+                    const char* p2 = info.info;
+                    while (*p2) {
+                        const char* nl = strchr(p2, '\n'); size_t len = nl ? (size_t)(nl - p2) : strlen(p2);
+                        if (len >= 6 && strncmp(p2, "owner:", 6) == 0) { sscanf(p2+6, "%127s", owner); }
+                        else if (len >= 5 && strncmp(p2, "size:", 5) == 0) { sscanf(p2+5, "%63s", size); }
+                        else if (len >= 6 && strncmp(p2, "words:", 6) == 0) { sscanf(p2+6, "%63s", words); }
+                        else if (len >= 6 && strncmp(p2, "chars:", 6) == 0) { sscanf(p2+6, "%63s", chars); }
+                        else if (len >= 12 && strncmp(p2, "last_access:", 12) == 0) {
+                            // Copy whole line after label (timestamp may have spaces)
+                            size_t cplen = len - 12; if (cplen > sizeof(last)-1) cplen = sizeof(last)-1; memcpy(last, p2+12, cplen); last[cplen] = 0;
+                        } else if (len >= 14 && strncmp(p2, "last_modified:", 14) == 0) {
+                            size_t cplen = len - 14; if (cplen > sizeof(lastmod)-1) cplen = sizeof(lastmod)-1; memcpy(lastmod, p2+14, cplen); lastmod[cplen] = 0;
+                        }
+                        if (!nl) break; p2 = nl + 1;
+                    }
+                    snprintf(linebuf, sizeof(linebuf), "%s\towner:%s\tsize:%s\twords:%s\tchars:%s\tlast_access:%s\tlast_modified:%s\n", fname, owner, size, words, chars, last[0]?last:"-", lastmod[0]?lastmod:"-");
+                } else {
+                    snprintf(linebuf, sizeof(linebuf), "%s\n", fname);
+                }
+
+                size_t ln = strlen(linebuf);
+                if (pos + ln >= cap) { /* stop if would overflow */ break; }
+                memcpy(buffer + pos, linebuf, ln); pos += ln; buffer[pos] = '\0';
             }
             pthread_mutex_unlock(&file_registry_mutex);
 
             MsgViewFilesResponse resp = {0};
             strncpy(resp.file_list, buffer, sizeof(resp.file_list) - 1);
-
-            MsgHeader h = {0};
-            h.command = CMD_VIEW_FILES_RESP;
-            h.payload_size = sizeof(MsgViewFilesResponse);
-
-            if (!send_all(socket, &h, sizeof(h)) ||
-                !send_all(socket, &resp, sizeof(resp))) {
-                // Client disconnected
-            }
+            MsgHeader h = { .command = CMD_VIEW_FILES_RESP, .payload_size = sizeof(resp) };
+            send_all(socket, &h, sizeof(h));
+            send_all(socket, &resp, sizeof(resp));
             continue;
         } else if (header.command == CMD_READ_FILE && connections[slot].type == CONN_TYPE_CLIENT) {
             if (header.payload_size != sizeof(MsgReadFile)) {
@@ -435,31 +530,40 @@ void* handle_connection(void* arg) {
             pthread_mutex_lock(&connections_mutex);
             strncpy(req.requester, connections[slot].username, MAX_USERNAME_LEN - 1);
             req.requester[MAX_USERNAME_LEN - 1] = '\0';
-            int ss_sock = connections[ss_slot].socket;
+            int ss_sock_local = connections[ss_slot].socket;
             pthread_mutex_unlock(&connections_mutex);
 
-            // Forward to SS and proxy response
-            MsgHeader fwd = {0};
-            fwd.command = header.command;
-            fwd.payload_size = sizeof(req);
-            if (!send_all(ss_sock, &fwd, sizeof(fwd)) || !send_all(ss_sock, &req, sizeof(req))) {
-                send_error(socket, 502, "Failed to contact Storage Server");
-                continue;
-            }
+            // Forward to SS and proxy response with serialization
+            pthread_mutex_lock(&connections[ss_slot].ss_io_mutex);
             MsgHeader rs;
-            if (!recv_all(ss_sock, &rs, sizeof(rs))) {
-                send_error(socket, 502, "No response from Storage Server");
-                continue;
-            }
-            if (!send_all(socket, &rs, sizeof(rs))) continue;
-            // Proxy any payload
-            size_t rem = rs.payload_size; char buf[512];
-            while (rem > 0) {
-                size_t chunk = rem > sizeof(buf) ? sizeof(buf) : rem;
-                if (!recv_all(ss_sock, buf, chunk)) break;
-                if (!send_all(socket, buf, chunk)) break;
-                rem -= chunk;
-            }
+            do {
+                MsgHeader fwd = {0};
+                fwd.command = header.command;
+                fwd.payload_size = sizeof(req);
+                if (!send_all(ss_sock_local, &fwd, sizeof(fwd)) || !send_all(ss_sock_local, &req, sizeof(req))) {
+                    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                    send_error(socket, 502, "Failed to contact Storage Server");
+                    continue;
+                }
+                if (!recv_all(ss_sock_local, &rs, sizeof(rs))) {
+                    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                    send_error(socket, 502, "No response from Storage Server");
+                    continue;
+                }
+                if (!send_all(socket, &rs, sizeof(rs))) {
+                    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                    continue;
+                }
+                // Proxy any payload while holding SS lock
+                size_t rem = rs.payload_size; char buf[512];
+                while (rem > 0) {
+                    size_t chunk = rem > sizeof(buf) ? sizeof(buf) : rem;
+                    if (!recv_all(ss_sock_local, buf, chunk)) break;
+                    if (!send_all(socket, buf, chunk)) break;
+                    rem -= chunk;
+                }
+            } while (0);
+            pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
             continue;
         } else if (header.command == CMD_INFO && connections[slot].type == CONN_TYPE_CLIENT) {
             if (header.payload_size != sizeof(MsgInfoRequest)) {
@@ -486,16 +590,20 @@ void* handle_connection(void* arg) {
             if (ss_slot < 0) { send_error(socket, 404, "File not found"); continue; }
 
             pthread_mutex_lock(&connections_mutex);
-            int ss_sock = connections[ss_slot].socket;
+            int ss_sock_local = connections[ss_slot].socket;
             pthread_mutex_unlock(&connections_mutex);
 
-            MsgHeader fwd = {0}; fwd.command = CMD_INFO; fwd.payload_size = sizeof(req);
-            if (!send_all(ss_sock, &fwd, sizeof(fwd)) || !send_all(ss_sock, &req, sizeof(req))) { send_error(socket, 502, "Failed to contact Storage Server"); continue; }
+            pthread_mutex_lock(&connections[ss_slot].ss_io_mutex);
             MsgHeader rs;
-            if (!recv_all(ss_sock, &rs, sizeof(rs))) { send_error(socket, 502, "No response from Storage Server"); continue; }
-            if (!send_all(socket, &rs, sizeof(rs))) continue;
-            size_t rem = rs.payload_size; char buf[512];
-            while (rem > 0) { size_t chunk = rem > sizeof(buf) ? sizeof(buf) : rem; if (!recv_all(ss_sock, buf, chunk)) break; if (!send_all(socket, buf, chunk)) break; rem -= chunk; }
+            do {
+                MsgHeader fwd = {0}; fwd.command = CMD_INFO; fwd.payload_size = sizeof(req);
+                if (!send_all(ss_sock_local, &fwd, sizeof(fwd)) || !send_all(ss_sock_local, &req, sizeof(req))) { pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex); send_error(socket, 502, "Failed to contact Storage Server"); continue; }
+                if (!recv_all(ss_sock_local, &rs, sizeof(rs))) { pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex); send_error(socket, 502, "No response from Storage Server"); continue; }
+                if (!send_all(socket, &rs, sizeof(rs))) { pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex); continue; }
+                size_t rem = rs.payload_size; char buf[512];
+                while (rem > 0) { size_t chunk = rem > sizeof(buf) ? sizeof(buf) : rem; if (!recv_all(ss_sock_local, buf, chunk)) break; if (!send_all(socket, buf, chunk)) break; rem -= chunk; }
+            } while (0);
+            pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
             continue;
         }
 
@@ -510,53 +618,84 @@ void* handle_connection(void* arg) {
                 continue;
             }
 
-            int ss_slot = choose_ss_slot();
+            // Overwrite requester with authenticated username
+            strncpy(payload.requester, connections[slot].username, MAX_USERNAME_LEN-1);
+            payload.requester[MAX_USERNAME_LEN-1] = '\0';
+
+            // Resolve owning SS for this file
+            registry_refresh_from_ss();
+            int ss_slot = -1;
+            pthread_mutex_lock(&file_registry_mutex);
+            for (int i = 0; i < file_count; i++) {
+                if (strncmp(file_registry[i].filename, payload.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
+            }
+            pthread_mutex_unlock(&file_registry_mutex);
             if (ss_slot < 0) {
-                printf("[NM] No Storage Server available for DELETE '%s'\n", payload.filename);
-                send_error(socket, 503, "No Storage Server available");
+                send_error(socket, 404, "File not found");
                 continue;
             }
 
-            // Forward to SS
-            int ss_sock = connections[ss_slot].socket;
+            // Forward to SS with per-SS serialization
+            pthread_mutex_lock(&connections_mutex);
+            int ss_sock_local = connections[ss_slot].socket;
+            pthread_mutex_unlock(&connections_mutex);
             printf("[NM] Forwarding DELETE '%s' to SS at %s:%d (Slot %d)\n",
                    payload.filename, connections[ss_slot].ip_addr, connections[ss_slot].client_port, ss_slot);
 
-            MsgHeader fwd = {0};
-            fwd.command = CMD_DELETE_FILE;
-            fwd.payload_size = sizeof(MsgDeleteFile);
-            if (!send_all(ss_sock, &fwd, sizeof(fwd)) ||
-                !send_all(ss_sock, &payload, sizeof(payload))) {
-                send_error(socket, 502, "Failed to contact Storage Server");
-                continue;
-            }
-
-            // Receive SS response and proxy it back to the client
             MsgHeader ss_resp;
-            if (!recv_all(ss_sock, &ss_resp, sizeof(ss_resp))) {
-                send_error(socket, 502, "No response from Storage Server");
-                continue;
-            }
-
-            // Send header to client
-            if (!send_all(socket, &ss_resp, sizeof(ss_resp))) {
-                // Client disconnected
-                continue;
-            }
-
-            // Forward payload in full (if any)
-            size_t remaining = ss_resp.payload_size;
-            char buf[4096];
-            while (remaining > 0) {
-                size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
-                if (!recv_all(ss_sock, buf, chunk)) {
-                    send_error(socket, 502, "Failed to read SS payload");
-                    break;
+            pthread_mutex_lock(&connections[ss_slot].ss_io_mutex);
+            do {
+                MsgHeader fwd = {0};
+                fwd.command = CMD_DELETE_FILE;
+                fwd.payload_size = sizeof(MsgDeleteFile);
+                if (!send_all(ss_sock_local, &fwd, sizeof(fwd)) ||
+                    !send_all(ss_sock_local, &payload, sizeof(payload))) {
+                    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                    send_error(socket, 502, "Failed to contact Storage Server");
+                    continue;
                 }
-                if (!send_all(socket, buf, chunk)) {
-                    break;
+
+                // Receive SS response and proxy it back to the client
+                if (!recv_all(ss_sock_local, &ss_resp, sizeof(ss_resp))) {
+                    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                    send_error(socket, 502, "No response from Storage Server");
+                    continue;
                 }
-                remaining -= chunk;
+                // Send header to client now
+                if (!send_all(socket, &ss_resp, sizeof(ss_resp))) {
+                    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                    continue;
+                }
+
+                // Forward payload in full (if any) while holding lock
+                size_t remaining = ss_resp.payload_size;
+                char buf[4096];
+                while (remaining > 0) {
+                    size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+                    if (!recv_all(ss_sock_local, buf, chunk)) {
+                        pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                        send_error(socket, 502, "Failed to read SS payload");
+                        break;
+                    }
+                    if (!send_all(socket, buf, chunk)) {
+                        break;
+                    }
+                    remaining -= chunk;
+                }
+            } while (0);
+            pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+            // Optionally, remove from registry on success
+            if (ss_resp.command == CMD_ACK) {
+                pthread_mutex_lock(&file_registry_mutex);
+                for (int i = 0; i < file_count; i++) {
+                    if (strncmp(file_registry[i].filename, payload.filename, MAX_FILENAME_LEN) == 0) {
+                        // compact array
+                        for (int j = i + 1; j < file_count; j++) file_registry[j-1] = file_registry[j];
+                        file_count--;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&file_registry_mutex);
             }
             continue;
         }
@@ -572,6 +711,8 @@ void* handle_connection(void* arg) {
     pthread_mutex_lock(&connections_mutex);
     if (connections[slot].type == CONN_TYPE_SS) {
         printf("[NM] Removed Storage Server (Slot %d) from active list.\n", slot);
+        // Destroy per-SS mutex
+        pthread_mutex_destroy(&connections[slot].ss_io_mutex);
     } else if (connections[slot].type == CONN_TYPE_CLIENT) {
         printf("[NM] Removed Client '%s' (Slot %d) from active list.\n", connections[slot].username, slot);
     }
@@ -590,6 +731,7 @@ void handle_register_ss(int slot, const MsgRegisterSS* msg) {
     pthread_mutex_lock(&connections_mutex);
     connections[slot].type = CONN_TYPE_SS;
     connections[slot].client_port = msg->client_listen_port;
+    pthread_mutex_init(&connections[slot].ss_io_mutex, NULL);
     pthread_mutex_unlock(&connections_mutex);
 
     printf("[NM] Storage Server registered from %s. Listening for clients on port %d. (Slot: %d)\n",
@@ -687,36 +829,44 @@ static void registry_refresh_from_ss(void) {
         if (connections[i].type != CONN_TYPE_SS || connections[i].socket < 0) continue;
         int ss_sock = connections[i].socket;
 
+        // Serialize on this SS socket while requesting file list
+        pthread_mutex_lock(&connections[i].ss_io_mutex);
+
         // Send request
         MsgHeader rq = {0};
         rq.command = CMD_SS_LIST_FILES;
         rq.payload_size = 0;
         if (!send_all(ss_sock, &rq, sizeof(rq))) {
+            pthread_mutex_unlock(&connections[i].ss_io_mutex);
             continue; // skip this SS
         }
 
         // Read response header
         MsgHeader rs;
         if (!recv_all(ss_sock, &rs, sizeof(rs))) {
+            pthread_mutex_unlock(&connections[i].ss_io_mutex);
             continue;
         }
-        if (rs.command != CMD_SS_LIST_FILES_RESP || rs.payload_size != sizeof(MsgSSFileListResponse)) {
-            // Drain payload if any
-            size_t rem = rs.payload_size;
-            char drain[512];
+
+        MsgSSFileListResponse pl = {0};
+        if (rs.command == CMD_SS_LIST_FILES_RESP && rs.payload_size == sizeof(MsgSSFileListResponse)) {
+            if (!recv_all(ss_sock, &pl, sizeof(pl))) {
+                pthread_mutex_unlock(&connections[i].ss_io_mutex);
+                continue;
+            }
+        } else {
+            // Drain unexpected payload if any
+            size_t rem = rs.payload_size; char drain[512];
             while (rem > 0) {
                 size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem;
                 if (!recv_all(ss_sock, drain, chunk)) break;
                 rem -= chunk;
             }
+            pthread_mutex_unlock(&connections[i].ss_io_mutex);
             continue;
         }
 
-        // Read payload
-        MsgSSFileListResponse pl = {0};
-        if (!recv_all(ss_sock, &pl, sizeof(pl))) {
-            continue;
-        }
+        pthread_mutex_unlock(&connections[i].ss_io_mutex);
 
         // Parse newline-separated filenames, dedupe, and store mapping to this SS slot
         char* p = pl.files;
