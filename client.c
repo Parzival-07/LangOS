@@ -703,6 +703,23 @@ int main() {
             // Ensure a trailing newline for cleanliness
             if (flen > 0) printf("\n");
             close(ss_fd);
+        } else if (strcmp(command, "LIST") == 0) {
+            // Request user list from Name Server
+            MsgHeader h = (MsgHeader){ .command = CMD_LIST_USERS, .payload_size = 0 };
+            if (!send_all(nm_socket, &h, sizeof(h))) { fprintf(stderr, "[Client] Failed to send LIST.\n"); continue; }
+            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] NM disconnected.\n"); break; }
+            if (rh.command == CMD_LIST_USERS_RESP && rh.payload_size == sizeof(MsgUsersListResponse)) {
+                MsgUsersListResponse resp = {0};
+                if (!recv_all(nm_socket, &resp, sizeof(resp))) { fprintf(stderr, "[Client] Failed to read LIST payload.\n"); break; }
+                if (resp.users[0] == '\0') { printf("[Client] No users currently registered.\n"); }
+                else { printf("%s", resp.users); }
+            } else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) {
+                MsgError err; recv_all(nm_socket, &err, sizeof(err)); printf("[Client] LIST failed (%d): %s\n", err.code, err.message);
+            } else {
+                // Drain any unexpected payload
+                size_t rem = rh.payload_size; char drain[256]; while (rem > 0) { size_t ch = rem>sizeof(drain)?sizeof(drain):rem; if (!recv_all(nm_socket, drain, ch)) break; rem -= ch; }
+                printf("[Client] Unexpected response to LIST (%d).\n", rh.command);
+            }
         } else {
             printf("[Client] Unknown command: %s\n", command);
         }

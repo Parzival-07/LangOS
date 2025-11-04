@@ -59,7 +59,11 @@ typedef enum {
     CMD_WRITE_DONE = 362,
 
     // Undo last change (Client -> NM -> SS)
-    CMD_UNDO = 370
+    CMD_UNDO = 370,
+
+    // User listing
+    CMD_LIST_USERS = 380,
+    CMD_LIST_USERS_RESP = 381
 } CommandCode;
 
 // --- DATA STRUCTURES ---
@@ -190,6 +194,11 @@ typedef struct {
     char filename[MAX_FILENAME_LEN];
     char requester[MAX_USERNAME_LEN];
 } MsgUndoRequest;
+
+// Data for CMD_LIST_USERS_RESP
+typedef struct {
+    char users[16384]; // newline-separated usernames
+} MsgUsersListResponse;
 
 
 // --- HELPER FUNCTIONS ---

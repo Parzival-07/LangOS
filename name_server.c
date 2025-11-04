@@ -661,6 +661,34 @@ void* handle_connection(void* arg) {
             } while (0);
             pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
             continue;
+        } else if (header.command == CMD_LIST_USERS && connections[slot].type == CONN_TYPE_CLIENT) {
+            // No payload expected; if present, drain it
+            if (header.payload_size > 0) {
+                size_t rem = header.payload_size; char drain[256];
+                while (rem > 0) { size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(socket, drain, chunk)) break; rem -= chunk; }
+            }
+
+            // Assemble list of currently registered clients
+            MsgUsersListResponse resp = {0};
+            size_t pos = 0, cap = sizeof(resp.users);
+            pthread_mutex_lock(&connections_mutex);
+            for (int i = 0; i < MAX_CONNECTIONS; i++) {
+                if (connections[i].type == CONN_TYPE_CLIENT && connections[i].username[0]) {
+                    const char* u = connections[i].username;
+                    size_t ulen = strnlen(u, MAX_USERNAME_LEN);
+                    if (ulen + 1 <= cap - pos) {
+                        memcpy(resp.users + pos, u, ulen); pos += ulen; resp.users[pos++] = '\n';
+                    } else {
+                        break; // buffer full
+                    }
+                }
+            }
+            pthread_mutex_unlock(&connections_mutex);
+
+            MsgHeader h = { .command = CMD_LIST_USERS_RESP, .payload_size = sizeof(resp) };
+            send_all(socket, &h, sizeof(h));
+            send_all(socket, &resp, sizeof(resp));
+            continue;
         }
 
         if (header.command == CMD_DELETE_FILE && connections[slot].type == CONN_TYPE_CLIENT) {
