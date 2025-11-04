@@ -13,6 +13,10 @@
 #include <dirent.h>
 #include <ctype.h>
 
+// Forward declarations for UNDO helpers (defined later)
+static int undo_snapshot(const char* filename, const char* filepath);
+static int undo_restore_last(const char* filename, char* errbuf, size_t errlen);
+
 // --- Helpers for parsing and updating access lists ---
 static int list_contains(const char* list, const char* user) {
     if (!user || !*user) return 0;
@@ -391,6 +395,8 @@ int ss_write_replace_sentence(const char* filename, int sidx, const char* repl, 
         snprintf(errbuf, errlen, "Not found");
         return -1;
     }
+    // Snapshot for UNDO before making changes (best-effort)
+    (void)undo_snapshot(filename, path);
     int rc = ss_write_replace_sentence_impl(path, sidx, repl, errbuf, errlen);
     if (rc == 0) {
         // touch metadata 'updated'
@@ -511,6 +517,8 @@ static int ss_write_insert_sentence(const char* filename, int insert_idx, const 
     if (ensure_dir(STORAGE_ROOT) != 0) { snprintf(errbuf, errlen, "Storage dir error"); return -1; }
     char path[512]; snprintf(path, sizeof(path), STORAGE_ROOT "/%s", filename);
     struct stat st; if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) { snprintf(errbuf, errlen, "Not found"); return -1; }
+    // Snapshot for UNDO before making changes (best-effort)
+    (void)undo_snapshot(filename, path);
     int rc = ss_write_insert_sentence_impl(path, insert_idx, repl, errbuf, errlen);
     if (rc == 0) {
         char meta[512]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", filename);
@@ -540,6 +548,94 @@ static void sentence_lock_shift_from(const char* filename, int from_index, int d
         }
     }
     pthread_mutex_unlock(&g_sentence_locks_mutex);
+}
+
+static int sentence_lock_any_for_file(const char* filename) {
+    int found = 0;
+    pthread_mutex_lock(&g_sentence_locks_mutex);
+    for (int i = 0; i < MAX_SENTENCE_LOCKS; i++) {
+        if (g_sentence_locks[i].in_use && strncmp(g_sentence_locks[i].filename, filename, MAX_FILENAME_LEN) == 0) { found = 1; break; }
+    }
+    pthread_mutex_unlock(&g_sentence_locks_mutex);
+    return found;
+}
+
+// --- UNDO support: store snapshots under STORAGE_ROOT/.undo/<filename>/N.bak ---
+static int ensure_undo_root(void) {
+    char root[512]; snprintf(root, sizeof(root), STORAGE_ROOT "/.undo");
+    if (ensure_dir(STORAGE_ROOT) != 0) return -1;
+    return ensure_dir(root);
+}
+
+static int ensure_undo_dir_for(const char* filename, char* out_dir, size_t out_sz) {
+    if (!is_valid_filename(filename)) return -1;
+    if (ensure_undo_root() != 0) return -1;
+    snprintf(out_dir, out_sz, STORAGE_ROOT "/.undo/%s", filename);
+    if (ensure_dir(out_dir) != 0) return -1;
+    return 0;
+}
+
+static long find_next_undo_index(const char* dirpath) {
+    long max_idx = 0;
+    DIR* d = opendir(dirpath);
+    if (!d) return 1;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        char* endptr = NULL; long v = strtol(ent->d_name, &endptr, 10);
+        if (endptr && (*endptr == '\0' || strcmp(endptr, ".bak") == 0)) {
+            if (v > max_idx) max_idx = v;
+        }
+    }
+    closedir(d);
+    return max_idx + 1;
+}
+
+static int undo_snapshot(const char* filename, const char* filepath) {
+    char dir[512]; if (ensure_undo_dir_for(filename, dir, sizeof(dir)) != 0) return -1;
+    long idx = find_next_undo_index(dir);
+    char bakpath[700]; snprintf(bakpath, sizeof(bakpath), "%s/%ld.bak", dir, idx);
+    FILE* src = fopen(filepath, "rb"); if (!src) return -1;
+    FILE* dst = fopen(bakpath, "wb"); if (!dst) { fclose(src); return -1; }
+    char buf[4096]; size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), src)) > 0) {
+        if (fwrite(buf, 1, n, dst) != n) { fclose(src); fclose(dst); return -1; }
+    }
+    fclose(src); fclose(dst);
+    return 0;
+}
+
+static int undo_restore_last(const char* filename, char* errbuf, size_t errlen) {
+    if (!is_valid_filename(filename)) { snprintf(errbuf, errlen, "Invalid filename"); return -1; }
+    char dir[512]; if (ensure_undo_dir_for(filename, dir, sizeof(dir)) != 0) { snprintf(errbuf, errlen, "No undo history"); return -1; }
+    long best = -1; char bestname[512] = {0};
+    DIR* d = opendir(dir); if (!d) { snprintf(errbuf, errlen, "No undo history"); return -1; }
+    struct dirent* ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        char* endptr = NULL; long v = strtol(ent->d_name, &endptr, 10);
+        if (endptr && (*endptr == '\0' || strcmp(endptr, ".bak") == 0)) {
+            if (v > best) { best = v; strncpy(bestname, ent->d_name, sizeof(bestname)-1); }
+        }
+    }
+    closedir(d);
+    if (best < 0) { snprintf(errbuf, errlen, "No undo history"); return -1; }
+    char bakpath[700]; snprintf(bakpath, sizeof(bakpath), "%s/%s", dir, bestname);
+    char content[600]; snprintf(content, sizeof(content), STORAGE_ROOT "/%s", filename);
+    char tmp[700]; snprintf(tmp, sizeof(tmp), "%s.tmp", content);
+    FILE* src = fopen(bakpath, "rb"); if (!src) { snprintf(errbuf, errlen, "Open backup failed"); return -1; }
+    FILE* dst = fopen(tmp, "wb"); if (!dst) { fclose(src); snprintf(errbuf, errlen, "Tmp open failed"); return -1; }
+    char buf[4096]; size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), src)) > 0) {
+        if (fwrite(buf, 1, n, dst) != n) { fclose(src); fclose(dst); remove(tmp); snprintf(errbuf, errlen, "Write failed"); return -1; }
+    }
+    fclose(src); fclose(dst);
+    if (rename(tmp, content) != 0) { remove(tmp); snprintf(errbuf, errlen, "Replace failed"); return -1; }
+    remove(bakpath);
+    // touch metadata updated
+    char meta[600]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", filename);
+    FILE* mf = fopen(meta, "a"); if (mf) { time_t now = time(NULL); fprintf(mf, "updated:%lld\n", (long long)now); fclose(mf); }
+    return 0;
 }
 
 /**
@@ -1009,6 +1105,8 @@ void* listen_to_nm(void* arg) {
                         const char* name = ent->d_name;
                         // Skip . and ..
                         if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+                        // Skip internal undo directory
+                        if (strcmp(name, ".undo") == 0) continue;
                         // Skip metadata files
                         size_t nlen = strlen(name);
                         if (nlen > 5 && strcmp(name + nlen - 5, ".meta") == 0) continue;
@@ -1199,6 +1297,35 @@ void* listen_to_nm(void* arg) {
                 MsgHeader h = { .command = CMD_INFO_RESP, .payload_size = sizeof(resp) };
                 send_all(nm_socket, &h, sizeof(h));
                 send_all(nm_socket, &resp, sizeof(resp));
+                break;
+            }
+            case CMD_UNDO: {
+                if (header.payload_size != sizeof(MsgUndoRequest)) { nm_send_error(400, "Bad payload size"); break; }
+                MsgUndoRequest req; if (!recv_all(nm_socket, &req, sizeof(req))) { nm_send_error(400, "Payload read failed"); break; }
+                if (!is_valid_filename(req.filename)) { nm_send_error(400, "Invalid filename"); break; }
+                // ACL: owner or writer can undo
+                char meta[512]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", req.filename);
+                FILE* mf = fopen(meta, "r"); if (!mf) { nm_send_error(404, "File not found"); break; }
+                char owner[MAX_USERNAME_LEN] = {0}; char writers[1024] = {0}; char line[2048];
+                while (fgets(line, sizeof(line), mf)) {
+                    if (strncmp(line, "owner:", 6) == 0) { sscanf(line+6, "%63s", owner); }
+                    else if (strncmp(line, "writers:", 8) == 0) { strncpy(writers, line+8, sizeof(writers)-1); }
+                }
+                fclose(mf);
+                trim_both(writers);
+                if (!( (owner[0] && req.requester[0] && strncmp(owner, req.requester, MAX_USERNAME_LEN)==0) || list_contains(writers, req.requester) )) {
+                    nm_send_error(403, "Write access denied");
+                    break;
+                }
+                // Ensure no active sentence locks for this file
+                if (sentence_lock_any_for_file(req.filename)) { nm_send_error(423, "File has active write lock"); break; }
+                char err[256] = {0};
+                if (undo_restore_last(req.filename, err, sizeof(err)) == 0) {
+                    MsgHeader ack = (MsgHeader){ .command = CMD_ACK, .payload_size = 0 };
+                    send_all(nm_socket, &ack, sizeof(ack));
+                } else {
+                    nm_send_error(404, err[0]?err:"No undo available");
+                }
                 break;
             }
             default:

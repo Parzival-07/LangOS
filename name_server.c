@@ -605,6 +605,62 @@ void* handle_connection(void* arg) {
             } while (0);
             pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
             continue;
+        } else if (header.command == CMD_UNDO && connections[slot].type == CONN_TYPE_CLIENT) {
+            if (header.payload_size != sizeof(MsgUndoRequest)) {
+                send_error(socket, 400, "Bad payload size");
+                // Drain unexpected payload
+                size_t rem = header.payload_size; char drain[256];
+                while (rem > 0) { size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(socket, drain, chunk)) break; rem -= chunk; }
+                continue;
+            }
+            MsgUndoRequest req;
+            if (!recv_all(socket, &req, sizeof(req))) { send_error(socket, 400, "Payload read failed"); continue; }
+            // Overwrite requester with authenticated username
+            strncpy(req.requester, connections[slot].username, MAX_USERNAME_LEN-1);
+            req.requester[MAX_USERNAME_LEN-1] = '\0';
+
+            // Find owning SS
+            registry_refresh_from_ss();
+            int ss_slot = -1;
+            pthread_mutex_lock(&file_registry_mutex);
+            for (int i = 0; i < file_count; i++) {
+                if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
+            }
+            pthread_mutex_unlock(&file_registry_mutex);
+            if (ss_slot < 0) { send_error(socket, 404, "File not found"); continue; }
+
+            pthread_mutex_lock(&connections_mutex);
+            int ss_sock_local = connections[ss_slot].socket;
+            pthread_mutex_unlock(&connections_mutex);
+
+            pthread_mutex_lock(&connections[ss_slot].ss_io_mutex);
+            MsgHeader rs;
+            do {
+                MsgHeader fwd = {0}; fwd.command = CMD_UNDO; fwd.payload_size = sizeof(req);
+                if (!send_all(ss_sock_local, &fwd, sizeof(fwd)) || !send_all(ss_sock_local, &req, sizeof(req))) {
+                    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                    send_error(socket, 502, "Failed to contact Storage Server");
+                    continue;
+                }
+                if (!recv_all(ss_sock_local, &rs, sizeof(rs))) {
+                    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                    send_error(socket, 502, "No response from Storage Server");
+                    continue;
+                }
+                if (!send_all(socket, &rs, sizeof(rs))) {
+                    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                    continue;
+                }
+                size_t rem = rs.payload_size; char buf[512];
+                while (rem > 0) {
+                    size_t chunk = rem > sizeof(buf) ? sizeof(buf) : rem;
+                    if (!recv_all(ss_sock_local, buf, chunk)) break;
+                    if (!send_all(socket, buf, chunk)) break;
+                    rem -= chunk;
+                }
+            } while (0);
+            pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+            continue;
         }
 
         if (header.command == CMD_DELETE_FILE && connections[slot].type == CONN_TYPE_CLIENT) {

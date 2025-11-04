@@ -56,7 +56,10 @@ typedef enum {
     CMD_WRITE_BEGIN = 360,
     // Direct client -> SS write (apply and finalize)
     CMD_WRITE_FILE = 361,
-    CMD_WRITE_DONE = 362
+    CMD_WRITE_DONE = 362,
+
+    // Undo last change (Client -> NM -> SS)
+    CMD_UNDO = 370
 } CommandCode;
 
 // --- DATA STRUCTURES ---
@@ -181,6 +184,12 @@ typedef struct {
     int sentence_index;        // 0-based
     char requester[MAX_USERNAME_LEN]; // who is requesting
 } MsgWriteDone;
+
+// Data for CMD_UNDO (Client -> NM -> SS)
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+    char requester[MAX_USERNAME_LEN];
+} MsgUndoRequest;
 
 
 // --- HELPER FUNCTIONS ---

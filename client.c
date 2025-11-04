@@ -242,7 +242,8 @@ int main() {
             }
         } else if (strcmp(command, "VIEW") == 0) {
             // VIEW flags: -a (all), -l (long listing). Accept combinations: -a, -l, -al, -la
-            int show_all = 0, long_list = 0;
+            // Default behavior: show all files so users can discover files (even without access)
+            int show_all = 1, long_list = 0;
             char* flag = strtok(NULL, " ");
             if (flag) {
                 if (strcmp(flag, "-a") == 0) { show_all = 1; }
@@ -603,6 +604,29 @@ int main() {
                 // Drain unexpected
                 size_t rem = rh.payload_size; char drain[256]; while (rem > 0) { size_t chunk = rem > sizeof(drain)?sizeof(drain):rem; if (!recv_all(nm_socket, drain, chunk)) break; rem -= chunk; }
                 printf("[Client] Unexpected response (%d).\n", rh.command);
+            }
+        } else if (strcmp(command, "UNDO") == 0) {
+            char* fname = strtok(NULL, " ");
+            if (!fname) { printf("[Client] Usage: UNDO <filename>\n"); continue; }
+            MsgUndoRequest rq = (MsgUndoRequest){0};
+            strncpy(rq.filename, fname, MAX_FILENAME_LEN-1);
+            strncpy(rq.requester, username, MAX_USERNAME_LEN-1);
+            MsgHeader h = { .command = CMD_UNDO, .payload_size = sizeof(rq) };
+            if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &rq, sizeof(rq))) {
+                fprintf(stderr, "[Client] Failed to send UNDO.\n");
+                continue;
+            }
+            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] NM disconnected.\n"); break; }
+            if (rh.command == CMD_ACK) {
+                printf("[Client] Undo applied to '%s'.\n", fname);
+            } else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) {
+                MsgError err; recv_all(nm_socket, &err, sizeof(err));
+                printf("[Client] UNDO failed (%d): %s\n", err.code, err.message);
+            } else {
+                // Drain unexpected response
+                size_t rem = rh.payload_size; char drain[256];
+                while (rem > 0) { size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(nm_socket, drain, chunk)) break; rem -= chunk; }
+                printf("[Client] Unexpected response to UNDO (%d).\n", rh.command);
             }
         } else if (strcmp(command, "READ") == 0) {
             char* fname = strtok(NULL, " ");
