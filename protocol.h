@@ -98,6 +98,7 @@ typedef struct {
 // Client -> NM -> SS
 typedef struct {
     char filename[MAX_FILENAME_LEN];
+    char requester[MAX_USERNAME_LEN]; // NM will overwrite with authenticated username
 } MsgDeleteFile;
 
 // Data for CMD_VIEW_FILES_RESP
@@ -105,6 +106,14 @@ typedef struct {
 typedef struct {
     char file_list[16384];
 } MsgViewFilesResponse;
+
+// Data for CMD_VIEW_FILES (request with flags)
+// Client -> NM
+typedef struct {
+    int show_all;                 // 0: only accessible files, 1: all files
+    int long_list;                // 0: names only, 1: include details
+    char requester[MAX_USERNAME_LEN]; // NM may ignore and use authenticated username
+} MsgViewFilesRequest;
 
 // Data for CMD_SS_LIST_FILES_RESP
 // SS -> NM: newline-separated list of filenames on that SS
@@ -116,6 +125,7 @@ typedef struct {
 // Client -> NM
 typedef struct {
     char filename[MAX_FILENAME_LEN];
+    char requester[MAX_USERNAME_LEN]; // who is requesting (for ACL checks on SS)
 } MsgReadFile;
 
 // Data for CMD_READ_FILE_RESP
@@ -152,6 +162,7 @@ typedef struct {
 typedef struct {
     char filename[MAX_FILENAME_LEN];
     int  sentence_index;       // 0-based
+    char requester[MAX_USERNAME_LEN]; // who is requesting (for ACL checks on SS)
 } MsgWriteBegin;
 
 // Data for CMD_WRITE_FILE (direct client -> SS)
@@ -161,12 +172,14 @@ typedef struct {
     char filename[MAX_FILENAME_LEN];
     int  sentence_index;       // 0-based
     char replacement[2048];    // new sentence text (UTF-8)
+    char requester[MAX_USERNAME_LEN]; // who is requesting (for ACL checks on SS)
 } MsgWriteFile;
 
 // Data for CMD_WRITE_DONE (client -> SS): release a previously acquired sentence lock
 typedef struct {
     char filename[MAX_FILENAME_LEN];
     int sentence_index;        // 0-based
+    char requester[MAX_USERNAME_LEN]; // who is requesting
 } MsgWriteDone;
 
 
