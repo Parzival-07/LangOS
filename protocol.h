@@ -63,7 +63,10 @@ typedef enum {
 
     // User listing
     CMD_LIST_USERS = 380,
-    CMD_LIST_USERS_RESP = 381
+    CMD_LIST_USERS_RESP = 381,
+
+    // Execute file contents as shell commands (on Name Server)
+    CMD_EXEC = 390
 } CommandCode;
 
 // --- DATA STRUCTURES ---
@@ -199,6 +202,12 @@ typedef struct {
 typedef struct {
     char users[16384]; // newline-separated usernames
 } MsgUsersListResponse;
+
+// Data for CMD_EXEC (Client -> NM)
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+    char requester[MAX_USERNAME_LEN];
+} MsgExecRequest;
 
 
 // --- HELPER FUNCTIONS ---

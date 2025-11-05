@@ -69,6 +69,42 @@ static void send_error(int socket, int code, const char* msg);
 static void registry_add_file_if_absent(const char* filename, const char* owner, int ss_slot);
 static void registry_refresh_from_ss(void);
 
+// Helper: fetch file contents from SS using client port (header-based READ)
+static int nm_fetch_file_from_ss(const char* ss_ip, int ss_port, const char* filename, const char* requester, char** out_data, int* out_size) {
+    if (!ss_ip || !filename || !requester || !out_data || !out_size) return -1;
+    *out_data = NULL; *out_size = 0;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -2;
+    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET; addr.sin_port = htons((uint16_t)ss_port);
+    if (inet_pton(AF_INET, ss_ip, &addr.sin_addr) <= 0) { close(fd); return -3; }
+    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(fd); return -4; }
+    MsgHeader rq = (MsgHeader){ .command = CMD_READ_FILE, .payload_size = sizeof(MsgReadFile) };
+    MsgReadFile rf = {0}; strncpy(rf.filename, filename, MAX_FILENAME_LEN-1); strncpy(rf.requester, requester, MAX_USERNAME_LEN-1);
+    if (!send_all(fd, &rq, sizeof(rq)) || !send_all(fd, &rf, sizeof(rf))) { close(fd); return -5; }
+    MsgHeader rs; if (!recv_all(fd, &rs, sizeof(rs))) { close(fd); return -6; }
+    if (rs.command == CMD_ERROR && rs.payload_size == sizeof(MsgError)) {
+        // consume error payload but signal error by negative size
+        MsgError e; (void)recv_all(fd, &e, sizeof(e)); close(fd); return -1000 - e.code; // encode error code
+    }
+    if (rs.command != CMD_ACK || rs.payload_size < 0) {
+        // drain unexpected
+        int rem = rs.payload_size; char drain[512]; while (rem > 0) { int ch = rem>(int)sizeof(drain)?(int)sizeof(drain):rem; ssize_t r = recv(fd, drain, (size_t)ch, 0); if (r <= 0) break; rem -= (int)r; }
+        close(fd); return -7;
+    }
+    int n = rs.payload_size;
+    char* buf = (char*)malloc((size_t)n + 1);
+    if (!buf) { // drain
+        int rem = n; char drain[512]; while (rem > 0) { int ch = rem>(int)sizeof(drain)?(int)sizeof(drain):rem; ssize_t r = recv(fd, drain, (size_t)ch, 0); if (r <= 0) break; rem -= (int)r; }
+        close(fd); return -8;
+    }
+    if (n > 0 && !recv_all(fd, buf, (size_t)n)) { free(buf); close(fd); return -9; }
+    buf[n] = '\0';
+    *out_data = buf; *out_size = n;
+    close(fd);
+    return 0;
+}
+
 // --- MAIN SERVER LOGIC ---
 
 int main() {
@@ -625,7 +661,7 @@ void* handle_connection(void* arg) {
             } while (0);
             pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
             continue;
-        } else if (header.command == CMD_LIST_USERS && connections[slot].type == CONN_TYPE_CLIENT) {
+    } else if (header.command == CMD_LIST_USERS && connections[slot].type == CONN_TYPE_CLIENT) {
             // No payload expected; if present, drain it
             if (header.payload_size > 0) {
                 size_t rem = header.payload_size; char drain[256];
@@ -652,6 +688,95 @@ void* handle_connection(void* arg) {
             MsgHeader h = { .command = CMD_LIST_USERS_RESP, .payload_size = sizeof(resp) };
             send_all(socket, &h, sizeof(h));
             send_all(socket, &resp, sizeof(resp));
+            continue;
+        } else if (header.command == CMD_EXEC && connections[slot].type == CONN_TYPE_CLIENT) {
+            if (header.payload_size != sizeof(MsgExecRequest)) {
+                send_error(socket, 400, "Bad payload size");
+                // Drain
+                size_t rem = header.payload_size; char drain[256];
+                while (rem > 0) { size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(socket, drain, chunk)) break; rem -= chunk; }
+                continue;
+            }
+            MsgExecRequest rq;
+            if (!recv_all(socket, &rq, sizeof(rq))) { send_error(socket, 400, "Payload read failed"); continue; }
+            // Overwrite requester with authenticated username
+            strncpy(rq.requester, connections[slot].username, MAX_USERNAME_LEN-1);
+            rq.requester[MAX_USERNAME_LEN-1] = '\0';
+
+            // Resolve owning SS
+            registry_refresh_from_ss();
+            int ss_slot = -1;
+            pthread_mutex_lock(&file_registry_mutex);
+            for (int i = 0; i < file_count; i++) {
+                if (strncmp(file_registry[i].filename, rq.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
+            }
+            pthread_mutex_unlock(&file_registry_mutex);
+            if (ss_slot < 0) { send_error(socket, 404, "File not found"); continue; }
+
+            // Contact SS's client port to fetch file content using header-based READ (SS enforces ACL)
+            char ss_ip[MAX_IP_LEN] = {0};
+            int ss_port = 0;
+            pthread_mutex_lock(&connections_mutex);
+            strncpy(ss_ip, connections[ss_slot].ip_addr, sizeof(ss_ip)-1);
+            ss_port = connections[ss_slot].client_port;
+            pthread_mutex_unlock(&connections_mutex);
+
+            char* file_data = NULL; int file_size = 0;
+            int ff_rc = nm_fetch_file_from_ss(ss_ip, ss_port, rq.filename, rq.requester, &file_data, &file_size);
+            if (ff_rc != 0) {
+                if (ff_rc <= -1000) { // encoded SS error
+                    int code = -1000 - ff_rc; send_error(socket, code ? code : 502, "READ denied or failed");
+                } else {
+                    send_error(socket, 502, "Failed to fetch file from SS");
+                }
+                if (file_data) free(file_data);
+                continue;
+            }
+
+            // Execute on Name Server host using /bin/sh -s < tmpfile, capturing stdout+stderr
+            char tmpl[] = "/tmp/nm_exec_XXXXXX";
+            int tfd = mkstemp(tmpl);
+            if (tfd < 0) {
+                free(file_data);
+                send_error(socket, 500, "mkstemp failed");
+                continue;
+            }
+            ssize_t wr = 0; ssize_t to_write = file_size; char* p = file_data;
+            while (to_write > 0) { ssize_t n = write(tfd, p, (size_t)to_write > 8192 ? 8192 : (size_t)to_write); if (n <= 0) break; to_write -= n; p += n; wr += n; }
+            close(tfd);
+
+            char cmd[512]; snprintf(cmd, sizeof(cmd), "/bin/sh -s < %s 2>&1", tmpl);
+            FILE* pp = popen(cmd, "r");
+            if (!pp) {
+                unlink(tmpl);
+                free(file_data);
+                send_error(socket, 500, "popen failed");
+                continue;
+            }
+            // Keep the temp file until the shell finishes; unlink after pclose to avoid races
+            free(file_data);
+
+            // Read all output
+            char* out = NULL; size_t out_sz = 0; size_t out_cap = 0;
+            char obuf[4096]; size_t r;
+            while ((r = fread(obuf, 1, sizeof(obuf), pp)) > 0) {
+                if (out_sz + r + 1 > out_cap) { size_t new_cap = out_cap ? out_cap * 2 : 8192; while (new_cap < out_sz + r + 1) new_cap *= 2; char* nbuf = realloc(out, new_cap); if (!nbuf) { out_sz = 0; break; } out = nbuf; out_cap = new_cap; }
+                memcpy(out + out_sz, obuf, r); out_sz += r; out[out_sz] = '\0';
+            }
+            pclose(pp);
+            unlink(tmpl);
+
+            // Send output as ACK payload (if no output, send zero-length ACK)
+            if (!out) {
+                MsgHeader ah0 = { .command = CMD_ACK, .payload_size = 0 };
+                send_all(socket, &ah0, sizeof(ah0));
+                continue;
+            }
+            MsgHeader ah = { .command = CMD_ACK, .payload_size = (int)out_sz };
+            if (!send_all(socket, &ah, sizeof(ah)) || (out_sz > 0 && !send_all(socket, out, out_sz))) {
+                // client disconnected; drop
+            }
+            free(out);
             continue;
         }
 
