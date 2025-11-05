@@ -793,6 +793,37 @@ write_cancel_release:
                 size_t rem = rh.payload_size; char drain[256]; while (rem > 0) { size_t ch = rem>sizeof(drain)?sizeof(drain):rem; if (!recv_all(nm_socket, drain, ch)) break; rem -= ch; }
                 printf("[Client] Unexpected response to LIST (%d).\n", rh.command);
             }
+        } else if (strcmp(command, "EXEC") == 0) {
+            char* fname = strtok(NULL, " ");
+            if (!fname) { printf("[Client] Usage: EXEC <filename>\n"); continue; }
+            MsgExecRequest rq = (MsgExecRequest){0};
+            strncpy(rq.filename, fname, MAX_FILENAME_LEN-1);
+            strncpy(rq.requester, username, MAX_USERNAME_LEN-1);
+            MsgHeader h = { .command = CMD_EXEC, .payload_size = sizeof(rq) };
+            if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &rq, sizeof(rq))) {
+                fprintf(stderr, "[Client] Failed to send EXEC.\n");
+                continue;
+            }
+            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] NM disconnected.\n"); break; }
+            if (rh.command == CMD_ACK && rh.payload_size >= 0) {
+                int n = rh.payload_size; if (n > 0) {
+                    char* buf = (char*)malloc((size_t)n+1); if (!buf) { fprintf(stderr, "[Client] OOM.\n"); continue; }
+                    if (!recv_all(nm_socket, buf, (size_t)n)) { fprintf(stderr, "[Client] Failed to read EXEC output.\n"); free(buf); continue; }
+                    buf[n] = '\0';
+                    fwrite(buf, 1, (size_t)n, stdout);
+                    // Ensure trailing newline for cleanliness if output didn't end with one
+                    if (n > 0 && buf[n-1] != '\n') putchar('\n');
+                    free(buf);
+                } else {
+                    // No output
+                }
+            } else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) {
+                MsgError err; recv_all(nm_socket, &err, sizeof(err)); printf("[Client] EXEC failed (%d): %s\n", err.code, err.message);
+            } else {
+                // Drain
+                size_t rem = rh.payload_size; char drain[256]; while (rem > 0) { size_t ch = rem>sizeof(drain)?sizeof(drain):rem; if (!recv_all(nm_socket, drain, ch)) break; rem -= ch; }
+                printf("[Client] Unexpected response to EXEC (%d).\n", rh.command);
+            }
         } else {
             printf("[Client] Unknown command: %s\n", command);
         }
