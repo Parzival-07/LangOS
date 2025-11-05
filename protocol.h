@@ -254,3 +254,4 @@ static inline bool recv_all(int socket_fd, void* buffer, size_t size) {
 }
 
 #endif // PROTOCOL_H
+
