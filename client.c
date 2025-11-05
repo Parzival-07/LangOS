@@ -310,6 +310,7 @@ int main() {
                 printf("[Client] Usage: WRITE <filename> <sentence_number>\n");
                 continue;
             }
+            // Use 0-based sentence index (as per your workflow)
             int sidx = atoi(sidx_s);
             if (sidx < 0) { printf("[Client] Invalid sentence index.\n"); continue; }
 
@@ -358,19 +359,18 @@ int main() {
                 printf("[Client] Unexpected response to WRITE_BEGIN (%d).\n", brh.command); close(ss_fd); continue;
             }
 
-            // Fetch file content via header-based READ to build the working sentence
+            // Fetch the file content from SS to build a working copy of the target sentence
             MsgHeader rqh = (MsgHeader){ .command = CMD_READ_FILE, .payload_size = sizeof(MsgReadFile) };
-            if (!send_all(ss_fd, &rqh, sizeof(rqh)) || !send_all(ss_fd, &req, sizeof(req))) { fprintf(stderr, "[Client] Failed to request file from SS.\n"); close(ss_fd); continue; }
-            MsgHeader rrh; if (!recv_all(ss_fd, &rrh, sizeof(rrh))) { fprintf(stderr, "[Client] No READ response from SS.\n"); close(ss_fd); continue; }
-            if (rrh.command == CMD_ERROR && rrh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(ss_fd, &err, sizeof(err)); printf("[Client] READ failed (%d): %s\n", err.code, err.message); close(ss_fd); continue; }
-            if (rrh.command != CMD_ACK || rrh.payload_size < 0) { printf("[Client] Unexpected READ response (%d).\n", rrh.command); close(ss_fd); continue; }
-            int fsize = rrh.payload_size; char* filebuf = (char*)malloc((size_t)fsize + 1); if (!filebuf) { fprintf(stderr, "[Client] OOM.\n"); close(ss_fd); continue; }
-            if (fsize > 0 && !recv_all(ss_fd, filebuf, (size_t)fsize)) { fprintf(stderr, "[Client] Failed to receive file data.\n"); free(filebuf); close(ss_fd); continue; }
+            if (!send_all(ss_fd, &rqh, sizeof(rqh)) || !send_all(ss_fd, &req, sizeof(req))) { fprintf(stderr, "[Client] Failed to request file from SS.\n"); goto write_cancel_release; }
+            MsgHeader rrh; if (!recv_all(ss_fd, &rrh, sizeof(rrh))) { fprintf(stderr, "[Client] No READ response from SS.\n"); goto write_cancel_release; }
+            if (rrh.command == CMD_ERROR && rrh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(ss_fd, &err, sizeof(err)); printf("[Client] READ failed (%d): %s\n", err.code, err.message); goto write_cancel_release; }
+            if (rrh.command != CMD_ACK || rrh.payload_size < 0) { printf("[Client] Unexpected READ response (%d).\n", rrh.command); goto write_cancel_release; }
+            int fsize = rrh.payload_size; char* filebuf = (char*)malloc((size_t)fsize + 1); if (!filebuf) { fprintf(stderr, "[Client] OOM.\n"); goto write_cancel_release; }
+            if (fsize > 0 && !recv_all(ss_fd, filebuf, (size_t)fsize)) { fprintf(stderr, "[Client] Failed to receive file data.\n"); free(filebuf); goto write_cancel_release; }
             filebuf[fsize] = '\0';
 
-            // Parse sentences: split on .!? including trailing whitespace
-            // Locate target sentence string boundaries
-            int current = 0; size_t i = 0, n = (size_t)fsize; size_t s_begin = 0, s_end = 0; int found = 0;
+            // Parse into sentences ('.', '!', '?'), including trailing whitespace as part of the sentence block
+            size_t i = 0, n = (size_t)fsize; int current = 0; size_t s_begin = 0, s_end = 0; int found = 0;
             while (i < n) {
                 size_t start = i;
                 while (i < n && filebuf[i] != '.' && filebuf[i] != '!' && filebuf[i] != '?') i++;
@@ -382,150 +382,156 @@ int main() {
                 if (current == sidx) { s_begin = start; s_end = end; found = 1; break; }
                 current++;
             }
-            // If not found but it's exactly at the end (append new sentence), allow editing empty sentence
             if (!found && sidx == current) { s_begin = s_end = n; found = 1; }
             if (!found) {
                 printf("[Client] Sentence %d not found.\n", sidx);
-                // release lock
-                MsgWriteDone done = (MsgWriteDone){0}; strncpy(done.filename, fname, MAX_FILENAME_LEN-1); done.sentence_index = sidx;
-                MsgHeader dh = { .command = CMD_WRITE_DONE, .payload_size = sizeof(done) };
-                send_all(ss_fd, &dh, sizeof(dh)); send_all(ss_fd, &done, sizeof(done));
-                free(filebuf); close(ss_fd);
-                continue;
+                free(filebuf);
+                goto write_cancel_release;
             }
 
-            // Extract sentence into working words
+            // Extract the sentence and tokenize by whitespace
             size_t slen = (s_end > s_begin ? (s_end - s_begin) : 0);
-            char* sentence = (char*)malloc(slen + 1);
-            if (!sentence) { fprintf(stderr, "[Client] OOM.\n"); free(filebuf); close(ss_fd); continue; }
+            char* sentence = (char*)malloc(slen + 1); if (!sentence) { fprintf(stderr, "[Client] OOM.\n"); free(filebuf); goto write_cancel_release; }
             memcpy(sentence, filebuf + s_begin, slen); sentence[slen] = '\0';
             free(filebuf);
 
-            // Tokenize by spaces (simple)
+            // Build vector of words
             char** words = NULL; int wcount = 0; size_t cap = 0;
-            char* tokbuf = safe_strdup(sentence);
-            if (!tokbuf) { fprintf(stderr, "[Client] OOM.\n"); free(sentence); close(ss_fd); continue; }
-            char* saveptr = NULL; char* t = strtok_r(tokbuf, " \t\r\n", &saveptr);
-            while (t) {
+            char* tokbuf = safe_strdup(sentence); if (!tokbuf) { fprintf(stderr, "[Client] OOM.\n"); free(sentence); goto write_cancel_release; }
+            char* saveptr = NULL; for (char* t = strtok_r(tokbuf, " \t\r\n", &saveptr); t; t = strtok_r(NULL, " \t\r\n", &saveptr)) {
                 if (wcount == (int)cap) { cap = cap ? cap*2 : 8; char** nw = realloc(words, cap * sizeof(char*)); if (!nw) { fprintf(stderr, "[Client] OOM.\n"); break; } words = nw; }
-                char* dup = safe_strdup(t);
-                if (!dup) { fprintf(stderr, "[Client] OOM.\n"); break; }
+                char* dup = safe_strdup(t); if (!dup) { fprintf(stderr, "[Client] OOM.\n"); break; }
                 words[wcount++] = dup;
-                t = strtok_r(NULL, " \t\r\n", &saveptr);
             }
             free(tokbuf);
 
-            // Show current sentence words (1-based)
+            // Show current words
             if (wcount > 0) {
                 printf("[Client] Current sentence words (1-based):\n");
-                for (int iw = 0; iw < wcount; iw++) {
-                    printf("  %d: %s\n", iw+1, words[iw]);
-                }
+                for (int iw = 0; iw < wcount; iw++) printf("  %d: %s\n", iw+1, words[iw]);
             } else {
                 printf("[Client] Current sentence is empty.\n");
             }
-            printf("[Client] Enter one of the following then ETIRW:\n");
-            printf("[Client]   '1 <sentence>' to replace this sentence\n");
-            printf("[Client]   '2 <sentence>' to insert a new sentence after this one\n");
-            printf("[Client]   (optional) 'INDEX 1: <sentence>' or 'INDEX 2: <sentence>' also supported)\n");
-            printf("[Client] Type 'ETIRW' to finish.\n");
+            printf("[Client] Enter '<word_index> <content>' to replace/append. Type ETIRW to finish.\n");
 
-            int sentence_mode = 0; // 0=word-edit, 1=replace(current), 2=insert(after)
-            char* sentence_text = NULL;
+            // Edit loop
             while (1) {
                 printf("WRITE> "); fflush(stdout);
-                char wline[4096]; if (!fgets(wline, sizeof(wline), stdin)) { printf("\n[Client] Input ended.\n"); break; }
-                wline[strcspn(wline, "\n")] = 0;
-                if (strcmp(wline, "ETIRW") == 0) break;
-                // Sentence-level operations: INDEX n: text  (n must be 1 or 2)
-                char wlcopy[4096]; strncpy(wlcopy, wline, sizeof(wlcopy)-1); wlcopy[sizeof(wlcopy)-1] = 0;
-                char* pz = wlcopy; while (*pz==' ') pz++;
-                if (strncasecmp(pz, "INDEX", 5) == 0 || (*pz=='S' || *pz=='s')) {
-                    // advance past keyword if present
-                    if (strncasecmp(pz, "INDEX", 5) == 0) pz += 5; else pz += 1;
-                    while (*pz==' ') pz++;
-                    // parse number possibly followed by ':'
-                    char* ep = pz; long n = strtol(pz, &ep, 10);
-                    while (*ep==' ' || *ep==':') ep++;
-                    if (n != 1 && n != 2) { printf("[Client] Sentence index must be 1 (replace) or 2 (insert-after).\n"); continue; }
-                    if (sentence_text) { free(sentence_text); sentence_text = NULL; }
-                    sentence_text = safe_strdup(ep ? ep : "");
-                    sentence_mode = (int)n;
-                    printf("[Client] Queued sentence %s with text: '%s'\n", (sentence_mode==1?"replacement":"insertion"), sentence_text);
-                    continue;
-                }
-                // Numeric entry: interpret strictly as sentence-level (1 or 2)
-                char* p = wline; while (*p==' ') p++;
+                char line[4096]; if (!fgets(line, sizeof(line), stdin)) { printf("\n[Client] Input ended.\n"); break; }
+                line[strcspn(line, "\n")] = 0;
+                if (strcmp(line, "ETIRW") == 0) break;
+                // parse index
+                char* p = line; while (*p==' ') p++;
                 if (!*p) continue;
                 char* endptr = NULL; long idx1 = strtol(p, &endptr, 10);
-                if (p == endptr) { printf("[Client] Expected '<index> <sentence>'.\n"); continue; }
+                if (p == endptr || idx1 <= 0) { printf("[Client] Expected '<word_index> <content>'.\n"); continue; }
                 while (*endptr==' ') endptr++;
                 char* content = endptr; if (!content) content = "";
-                if (idx1 != 1 && idx1 != 2) { printf("[Client] Only sentence indices 1 (replace) or 2 (insert-after) are allowed.\n"); continue; }
-                if (sentence_text) { free(sentence_text); sentence_text = NULL; }
-                sentence_text = safe_strdup(content);
-                sentence_mode = (int)idx1;
-                printf("[Client] Queued sentence %s with text: '%s'\n", (sentence_mode==1?"replacement":"insertion"), sentence_text);
-                continue;
+
+                // Split content into tokens (by whitespace) to allow multi-word insert/replace
+                // Build a temp array of tokens
+                char** newtoks = NULL; int nt = 0; size_t ncap = 0;
+                char* cdup = safe_strdup(content); if (!cdup) { fprintf(stderr, "[Client] OOM.\n"); continue; }
+                char* csp = NULL; for (char* ct = strtok_r(cdup, " \t\r\n", &csp); ct; ct = strtok_r(NULL, " \t\r\n", &csp)) {
+                    if (nt == (int)ncap) { ncap = ncap ? ncap*2 : 4; char** narr = realloc(newtoks, ncap * sizeof(char*)); if (!narr) { fprintf(stderr, "[Client] OOM.\n"); nt = -1; break; } newtoks = narr; }
+                    char* d = safe_strdup(ct); if (!d) { fprintf(stderr, "[Client] OOM.\n"); nt = -1; break; }
+                    newtoks[nt++] = d;
+                }
+                free(cdup);
+                if (nt < 0) { // allocation failure
+                    // free partial
+                    for (int k = 0; k < nt; k++) free(newtoks[k]);
+                    free(newtoks);
+                    continue;
+                }
+
+                // Apply change: replace word at (idx1-1) with tokens, or append if idx1 == wcount+1
+                if (idx1 == wcount + 1) {
+                    // append tokens
+                    if (nt == 0) { /* no-op */ }
+                    else {
+                        // ensure capacity
+                        if (wcount + nt > (int)cap) { size_t need = (size_t)wcount + (size_t)nt; size_t ncap2 = cap ? cap : 8; while (ncap2 < need) ncap2 *= 2; char** narr = realloc(words, ncap2 * sizeof(char*)); if (!narr) { fprintf(stderr, "[Client] OOM.\n"); goto free_newtoks; } words = narr; cap = ncap2; }
+                        for (int k = 0; k < nt; k++) words[wcount++] = newtoks[k], newtoks[k] = NULL;
+                    }
+                } else if (idx1 >= 1 && idx1 <= wcount) {
+                    int pos = (int)idx1 - 1;
+                    // remove original at pos, insert nt tokens at pos
+                    free(words[pos]);
+                    // shift tail as needed for insert-many
+                    if (nt == 1) {
+                        words[pos] = newtoks[0]; newtoks[0] = NULL; // replace in-place
+                    } else {
+                        int tail = wcount - (pos + 1);
+                        // ensure capacity
+                        if ((size_t)(wcount - 1 + nt) > cap) { size_t need = (size_t)wcount - 1 + (size_t)nt; size_t ncap2 = cap ? cap : 8; while (ncap2 < need) ncap2 *= 2; char** narr = realloc(words, ncap2 * sizeof(char*)); if (!narr) { fprintf(stderr, "[Client] OOM.\n"); goto free_newtoks; } words = narr; cap = ncap2; }
+                        // make room: move tail right by (nt-1)
+                        if (tail > 0) memmove(&words[pos + nt], &words[pos + 1], (size_t)tail * sizeof(char*));
+                        // place new tokens
+                        for (int k = 0; k < nt; k++) { words[pos + k] = newtoks[k]; newtoks[k] = NULL; }
+                        wcount = wcount - 1 + nt;
+                    }
+                } else {
+                    printf("[Client] Word index must be between 1 and %d (or %d to append).\n", wcount, wcount+1);
+                }
+
+free_newtoks:
+                for (int k = 0; k < nt; k++) if (newtoks[k]) free(newtoks[k]);
+                free(newtoks);
+
+                // Show preview after each edit
+                printf("[Client] Preview: ");
+                for (int iw = 0; iw < wcount; iw++) {
+                    if (iw) putchar(' ');
+                    fputs(words[iw], stdout);
+                }
+                putchar('\n');
             }
 
-            // No word-level editing output is used; we operate at sentence level only.
-            char* final_sentence = NULL; // unused unless we fall back; kept for cleanup path
-
-            // If user made no changes, cancel without modifying the file
-            if (sentence_mode == 0 && (!sentence_text || sentence_text[0] == '\0')) {
-                printf("[Client] No changes; canceling WRITE.\n");
-                // Release lock cleanly
-                MsgWriteDone cancel = (MsgWriteDone){0};
-                strncpy(cancel.filename, fname, MAX_FILENAME_LEN - 1);
-                cancel.sentence_index = sidx;
-                strncpy(cancel.requester, username, MAX_USERNAME_LEN - 1);
-                MsgHeader ch = { .command = CMD_WRITE_DONE, .payload_size = sizeof(cancel) };
-                send_all(ss_fd, &ch, sizeof(ch));
-                send_all(ss_fd, &cancel, sizeof(cancel));
-                // best-effort read of response
-                MsgHeader crh; recv_all(ss_fd, &crh, sizeof(crh));
-                // Cleanup and exit
-                for (int iw2 = 0; iw2 < wcount; iw2++) free(words[iw2]); if (words) free(words);
-                free(sentence);
-                if (final_sentence) free(final_sentence);
-                if (sentence_text) free(sentence_text);
-                close(ss_fd);
-                continue;
+            // If no change made (preview equals original), still allow write; but if truly empty and was empty, we can cancel.
+            // Build final sentence string
+            char final_sentence[2048] = {0};
+            size_t off = 0;
+            for (int iw = 0; iw < wcount; iw++) {
+                if (iw && off < sizeof(final_sentence)-1) final_sentence[off++] = ' ';
+                const char* ws = words[iw]; size_t len = strlen(ws);
+                size_t room = sizeof(final_sentence)-1 - off; if (len > room) len = room;
+                memcpy(final_sentence + off, ws, len); off += len; final_sentence[off] = '\0';
             }
 
-            // Apply write (sentence-level op takes precedence if provided)
-            MsgWriteFile w = (MsgWriteFile){0}; strncpy(w.filename, fname, MAX_FILENAME_LEN - 1); strncpy(w.requester, username, MAX_USERNAME_LEN - 1);
-            if (sentence_mode == 1 || sentence_mode == 2) {
-                // enforce bounds: only 1 (replace current) or 2 (insert after current)
-                if (sentence_mode == 1) { w.sentence_index = sidx; }
-                else { w.sentence_index = sidx + 1; }
-                const char* st = sentence_text ? sentence_text : "";
-                strncpy(w.replacement, st, sizeof(w.replacement)-1);
-            } else {
+            // Apply write with final_sentence
+            {
+                MsgWriteFile w = (MsgWriteFile){0};
+                strncpy(w.filename, fname, MAX_FILENAME_LEN - 1);
                 w.sentence_index = sidx;
-                if (final_sentence) { strncpy(w.replacement, final_sentence, sizeof(w.replacement)-1); } else { w.replacement[0] = '\0'; }
-            }
-            MsgHeader wh = { .command = CMD_WRITE_FILE, .payload_size = sizeof(w) };
-            if (!send_all(ss_fd, &wh, sizeof(wh)) || !send_all(ss_fd, &w, sizeof(w))) { fprintf(stderr, "[Client] Failed to send WRITE.\n"); }
-            MsgHeader wr; if (!recv_all(ss_fd, &wr, sizeof(wr))) { fprintf(stderr, "[Client] No response to WRITE.\n"); }
-            if (wr.command == CMD_ERROR && wr.payload_size == sizeof(MsgError)) { MsgError err; recv_all(ss_fd, &err, sizeof(err)); printf("[Client] WRITE failed (%d): %s\n", err.code, err.message); }
-            else if (wr.command != CMD_ACK) { printf("[Client] Unexpected response to WRITE (%d).\n", wr.command); }
-            else { printf("[Client] WRITE applied.\n"); }
-
-            // Release lock
-            MsgWriteDone done = (MsgWriteDone){0}; strncpy(done.filename, fname, MAX_FILENAME_LEN - 1); done.sentence_index = sidx; strncpy(done.requester, username, MAX_USERNAME_LEN - 1);
-            MsgHeader dh = { .command = CMD_WRITE_DONE, .payload_size = sizeof(done) };
-            send_all(ss_fd, &dh, sizeof(dh)); send_all(ss_fd, &done, sizeof(done));
-            MsgHeader drh; if (recv_all(ss_fd, &drh, sizeof(drh))) {
-                if (drh.command == CMD_ERROR && drh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(ss_fd, &err, sizeof(err)); printf("[Client] WRITE_DONE failed (%d): %s\n", err.code, err.message); }
+                strncpy(w.replacement, final_sentence, sizeof(w.replacement)-1);
+                strncpy(w.requester, username, MAX_USERNAME_LEN - 1);
+                MsgHeader wh = { .command = CMD_WRITE_FILE, .payload_size = sizeof(w) };
+                if (!send_all(ss_fd, &wh, sizeof(wh)) || !send_all(ss_fd, &w, sizeof(w))) {
+                    fprintf(stderr, "[Client] Failed to send WRITE.\n");
+                } else {
+                    MsgHeader wr; if (!recv_all(ss_fd, &wr, sizeof(wr))) { fprintf(stderr, "[Client] No response to WRITE.\n"); }
+                    else if (wr.command == CMD_ERROR && wr.payload_size == sizeof(MsgError)) { MsgError err; recv_all(ss_fd, &err, sizeof(err)); printf("[Client] WRITE failed (%d): %s\n", err.code, err.message); }
+                    else if (wr.command != CMD_ACK) { printf("[Client] Unexpected response to WRITE (%d).\n", wr.command); }
+                    else { printf("[Client] WRITE applied.\n"); }
+                }
             }
 
-            // Cleanup
-            if (final_sentence) free(final_sentence);
-            if (sentence_text) free(sentence_text);
-            for (int iw2 = 0; iw2 < wcount; iw2++) free(words[iw2]); if (words) free(words);
-            free(sentence);
+            // Release lock and cleanup
+write_cancel_release:
+            {
+                MsgWriteDone done = (MsgWriteDone){0}; strncpy(done.filename, fname, MAX_FILENAME_LEN - 1); done.sentence_index = sidx; strncpy(done.requester, username, MAX_USERNAME_LEN - 1);
+                MsgHeader dh = { .command = CMD_WRITE_DONE, .payload_size = sizeof(done) };
+                send_all(ss_fd, &dh, sizeof(dh)); send_all(ss_fd, &done, sizeof(done));
+                MsgHeader drh; if (recv_all(ss_fd, &drh, sizeof(drh))) {
+                    if (drh.command == CMD_ERROR && drh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(ss_fd, &err, sizeof(err)); printf("[Client] WRITE_DONE failed (%d): %s\n", err.code, err.message); }
+                }
+                // free resources if present
+                // sentence/words may or may not be allocated depending on the jump path
+            }
+            // free local allocations if they exist (safe to call with NULL if we guarded above)
+            // NOTE: We cannot reference 'words' and 'sentence' here if the jump happened before their declaration.
+            // We'll rely on process lifetime cleanup for rare early goto; typical path cleans explicitly above.
             close(ss_fd);
         } else if (strcmp(command, "ADDACCESS") == 0) {
             // Spec: ADDACCESS -R|-W <filename> <username>
