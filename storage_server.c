@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <ctype.h>
+#include <signal.h>
 
 // Forward declarations for UNDO helpers (defined later)
 static int undo_snapshot(const char* filename, const char* filepath);
@@ -292,6 +293,24 @@ static int count_sentences_in_text(const char* s) {
     return cnt;
 }
 
+// Write replacement text ensuring a single space after sentence delimiters
+// if the next character is not whitespace or end-of-text. This normalizes
+// inputs like "line1.line2." to "line1. line2." while preserving existing
+// spacing (e.g., "Hello world. Nice day!" stays the same).
+static void write_with_delimiter_spaces(FILE* tf, const char* buf, size_t len) {
+    for (size_t i = 0; i < len; ++i) {
+        char c = buf[i];
+        fputc(c, tf);
+        if (parse_is_delim(c)) {
+            char next = (i + 1 < len) ? buf[i + 1] : '\0';
+            if (next && next != ' ' && next != '\n' && next != '\t' && next != '\r') {
+                // inject exactly one space
+                fputc(' ', tf);
+            }
+        }
+    }
+}
+
 static int ss_write_replace_sentence_impl(const char* filepath, int sidx, const char* repl, char* errbuf, size_t errlen) {
     // Read entire file
     FILE* f = fopen(filepath, "rb");
@@ -335,7 +354,7 @@ static int ss_write_replace_sentence_impl(const char* filepath, int sidx, const 
                 // The previous sentence's trailing whitespace (already written) will separate properly
                 replaced = 1;
             } else {
-                if (rend > rstart) { fwrite(repl + rstart, 1, rend - rstart, tf); wrote_any = 1; }
+                if (rend > rstart) { write_with_delimiter_spaces(tf, repl + rstart, rend - rstart); wrote_any = 1; }
                 // preserve original trailing whitespace so next sentence stays separated
                 size_t ws_start = end;
                 while (ws_start > start && (data[ws_start-1] == ' ' || data[ws_start-1] == '\n' || data[ws_start-1] == '\t' || data[ws_start-1] == '\r')) ws_start--;
@@ -360,7 +379,7 @@ static int ss_write_replace_sentence_impl(const char* filepath, int sidx, const 
         // empty file — index must be 0 to replace
         if (sidx == 0) {
             size_t rlen = strnlen(repl, 2048);
-            if (rlen > 0) fwrite(repl, 1, rlen, tf);
+            if (rlen > 0) write_with_delimiter_spaces(tf, repl, rlen);
             replaced = 1;
             idx = 1;
         }
@@ -389,7 +408,7 @@ static int ss_write_replace_sentence_impl(const char* filepath, int sidx, const 
                 if (!isspace((unsigned char)repl[rstart])) fputc(' ', tf2);
             }
         }
-        if (rend > rstart) fwrite(repl + rstart, 1, rend - rstart, tf2);
+        if (rend > rstart) write_with_delimiter_spaces(tf2, repl + rstart, rend - rstart);
         fclose(tf2);
         replaced = 1;
         idx++;
@@ -473,13 +492,10 @@ static int ss_write_insert_sentence_impl(const char* filepath, int insert_idx, c
             size_t rlen = strnlen(repl, 2048);
             size_t rstart = 0; while (rstart < rlen && isspace((unsigned char)repl[rstart])) rstart++;
             size_t rend = rlen; while (rend > rstart && isspace((unsigned char)repl[rend-1])) rend--;
+            // Always emit a single separator space before inserted sentence
+            fputc(' ', tf);
             if (rstart < rend) {
-                // one space between prev and inserted if inserted doesn't start with whitespace
-                fputc(' ', tf);
-                fwrite(repl + rstart, 1, rend - rstart, tf);
-            } else {
-                // empty insertion still keeps a single space to separate
-                fputc(' ', tf);
+                write_with_delimiter_spaces(tf, repl + rstart, rend - rstart);
             }
             // original whitespace (between prev and next) now separates inserted and next
             if (end > ws_start) fwrite(data + ws_start, 1, end - ws_start, tf);
@@ -503,7 +519,7 @@ static int ss_write_insert_sentence_impl(const char* filepath, int insert_idx, c
             size_t rlen = strnlen(repl, 2048);
             size_t rstart = 0; while (rstart < rlen && isspace((unsigned char)repl[rstart])) rstart++;
             size_t rend = rlen; while (rend > rstart && isspace((unsigned char)repl[rend-1])) rend--;
-            if (rend > rstart) fwrite(repl + rstart, 1, rend - rstart, tf);
+            if (rend > rstart) write_with_delimiter_spaces(tf, repl + rstart, rend - rstart);
             if (n > 0) {
                 // Add separator only if next content doesn't already start with whitespace
                 if (!(data[0] == ' ' || data[0] == '\n' || data[0] == '\t' || data[0] == '\r')) fputc(' ', tf);
@@ -525,7 +541,7 @@ static int ss_write_insert_sentence_impl(const char* filepath, int insert_idx, c
                         if (!isspace((unsigned char)repl[rstart])) fputc(' ', tf);
                     }
                 }
-                if (rend > rstart) fwrite(repl + rstart, 1, rend - rstart, tf);
+                if (rend > rstart) write_with_delimiter_spaces(tf, repl + rstart, rend - rstart);
                 inserted = 1;
             }
         }
@@ -704,22 +720,8 @@ static void* handle_one_client(void* arg) {
     int client_socket = a->client_socket;
     free(a);
 
-    // Try to detect whether the client is using header-based protocol (robustly)
-    MsgHeader peek;
-    ssize_t p = recv(client_socket, &peek, sizeof(peek), MSG_PEEK);
-    bool use_header = false;
-    if (p >= (ssize_t)sizeof(peek)) {
-        // Validate that the peeked bytes look like a real header
-        int cmd = (int)peek.command;
-        int ps  = (int)peek.payload_size;
-        if ((cmd == CMD_READ_FILE      && ps == (int)sizeof(MsgReadFile)) ||
-            (cmd == CMD_WRITE_FILE     && ps == (int)sizeof(MsgWriteFile)) ||
-            (cmd == CMD_WRITE_BEGIN    && ps == (int)sizeof(MsgWriteBegin)) ||
-            (cmd == CMD_WRITE_DONE     && ps == (int)sizeof(MsgWriteDone))) {
-            use_header = true;
-        }
-    }
-    if (use_header) {
+    // Always use header-based protocol for client connections.
+    {
         // Header-based loop
         while (true) {
             MsgHeader h;
@@ -917,6 +919,85 @@ static void* handle_one_client(void* arg) {
                     send_all(client_socket, &rh, sizeof(rh));
                     continue;
                 }
+                case CMD_STREAM: {
+                    if (h.payload_size != (int)sizeof(MsgStreamRequest)) {
+                        send_error_to(client_socket, 400, "Bad payload size");
+                        // Drain
+                        size_t rem = h.payload_size; char drain[512];
+                        while (rem > 0) { size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(client_socket, drain, chunk)) break; rem -= chunk; }
+                        // For STREAM errors, close to signal end to client
+                        close(client_socket);
+                        sentence_lock_release_all_for_owner(client_socket);
+                        return NULL;
+                    }
+                    MsgStreamRequest rq;
+                    if (!recv_all(client_socket, &rq, sizeof(rq))) { break; }
+                    if (!is_valid_filename(rq.filename)) { send_error_to(client_socket, 400, "Invalid filename"); close(client_socket); sentence_lock_release_all_for_owner(client_socket); return NULL; }
+                    // ACL: owner/readers/writers can stream (writers imply read)
+                    if (rq.requester[0] == '\0') { send_error_to(client_socket, 403, "Unauthorized"); close(client_socket); sentence_lock_release_all_for_owner(client_socket); return NULL; }
+                    char meta[512]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", rq.filename);
+                    FILE* mf = fopen(meta, "r"); if (!mf) { send_error_to(client_socket, 404, "Not found"); close(client_socket); sentence_lock_release_all_for_owner(client_socket); return NULL; }
+                    char owner[MAX_USERNAME_LEN] = {0}; char readers[1024] = {0}; char writers[1024] = {0}; char line[2048];
+                    while (fgets(line, sizeof(line), mf)) {
+                        if (strncmp(line, "owner:", 6) == 0) { sscanf(line+6, "%63s", owner); }
+                        else if (strncmp(line, "readers:", 8) == 0) { strncpy(readers, line+8, sizeof(readers)-1); }
+                        else if (strncmp(line, "writers:", 8) == 0) { strncpy(writers, line+8, sizeof(writers)-1); }
+                    }
+                    fclose(mf);
+                    trim_both(readers); trim_both(writers);
+                    if (!((owner[0] && strncmp(owner, rq.requester, MAX_USERNAME_LEN)==0) || list_contains(readers, rq.requester) || list_contains(writers, rq.requester))) {
+                        send_error_to(client_socket, 403, "Unauthorized");
+                        close(client_socket);
+                        sentence_lock_release_all_for_owner(client_socket);
+                        return NULL;
+                    }
+                    char path[512]; snprintf(path, sizeof(path), STORAGE_ROOT "/%s", rq.filename);
+                    FILE* f = fopen(path, "rb"); if (!f) { send_error_to(client_socket, 404, "Not found"); close(client_socket); sentence_lock_release_all_for_owner(client_socket); return NULL; }
+                    // Stream word-by-word but preserve original whitespace and do not add extra '\n' per word.
+                    // We insert a 0.1s delay after sending each word (and its following whitespace) to simulate streaming.
+                    int c; int in_word = 0; char word[4096]; size_t wpos = 0;
+                    while ((c = fgetc(f)) != EOF) {
+                        int is_ws = (c==' '||c=='\n'||c=='\t'||c=='\r'||c=='\f'||c=='\v');
+                        if (!is_ws) {
+                            if (wpos + 1 < sizeof(word)) { word[wpos++] = (char)c; }
+                            in_word = 1;
+                        } else {
+                            if (in_word) {
+                                // end of a word: send the word, then the whitespace run, then delay
+                                if (wpos > 0) { (void)send_all(client_socket, word, wpos); }
+                                // send this whitespace char and any subsequent whitespace chars as-is
+                                char ws[4096]; size_t wss = 0; ws[wss++] = (char)c;
+                                int c2;
+                                while ((c2 = fgetc(f)) != EOF) {
+                                    if (c2==' '||c2=='\n'||c2=='\t'||c2=='\r'||c2=='\f'||c2=='\v') {
+                                        if (wss + 1 < sizeof(ws)) ws[wss++] = (char)c2;
+                                    } else {
+                                        ungetc(c2, f);
+                                        break;
+                                    }
+                                }
+                                if (wss > 0) (void)send_all(client_socket, ws, wss);
+                                usleep(100000);
+                                wpos = 0; in_word = 0;
+                            } else {
+                                // outside a word: forward whitespace as-is
+                                char ch = (char)c; (void)send_all(client_socket, &ch, 1);
+                            }
+                        }
+                    }
+                    if (in_word && wpos > 0) {
+                        (void)send_all(client_socket, word, wpos);
+                        usleep(100000);
+                    }
+                    fclose(f);
+                    // Signal end with a sentinel line the client can detect
+                    (void)send_all(client_socket, "STOP\n", 5);
+                    // Close the connection immediately for cleanliness
+                    close(client_socket);
+                    // Release any locks held by this client
+                    sentence_lock_release_all_for_owner(client_socket);
+                    return NULL;
+                }
                 default: {
                     // Drain unknown payload
                     size_t rem = h.payload_size; char drain[512];
@@ -926,55 +1007,6 @@ static void* handle_one_client(void* arg) {
                 }
             }
         }
-    } else {
-        // Legacy/simple protocol (now ACL-aware): read two lines: username and filename
-        char user[MAX_USERNAME_LEN+2] = {0};
-        char fname[MAX_FILENAME_LEN+2] = {0};
-        size_t upos = 0;
-        while (upos < sizeof(user)-1) {
-            char ch; ssize_t r = recv(client_socket, &ch, 1, 0); if (r <= 0) break; if (ch == '\n') break; user[upos++] = ch;
-        }
-        size_t fpos = 0;
-        while (fpos < sizeof(fname)-1) {
-            char ch; ssize_t r = recv(client_socket, &ch, 1, 0); if (r <= 0) break; if (ch == '\n') break; fname[fpos++] = ch;
-        }
-        if (fpos == 0) {
-            // Backward compat: treat first line as filename, deny due to missing user
-            strncpy(fname, user, sizeof(fname)-1); user[0] = '\0';
-        }
-        if (!is_valid_filename(fname)) {
-            const char* msg = "ERROR: invalid filename\n"; send_all(client_socket, msg, strlen(msg)); close(client_socket); return NULL;
-        }
-
-        // ACL check from meta
-        int allowed = 0;
-        char meta[512]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", fname);
-        FILE* mf = fopen(meta, "r");
-        if (mf) {
-            char owner[MAX_USERNAME_LEN] = {0}; char readers[1024] = {0}; char writers[1024] = {0}; char line[2048];
-            while (fgets(line, sizeof(line), mf)) {
-                if (strncmp(line, "owner:", 6) == 0) { sscanf(line+6, "%63s", owner); }
-                else if (strncmp(line, "readers:", 8) == 0) { strncpy(readers, line+8, sizeof(readers)-1); }
-                else if (strncmp(line, "writers:", 8) == 0) { strncpy(writers, line+8, sizeof(writers)-1); }
-            }
-            fclose(mf);
-            trim_both(readers); trim_both(writers);
-            if (owner[0] && user[0] && strncmp(owner, user, MAX_USERNAME_LEN)==0) allowed = 1;
-            else if (user[0] && (list_contains(readers, user) || list_contains(writers, user))) allowed = 1; // writers imply read
-        }
-        if (!allowed) { const char* msg = "ERROR: unauthorized"; send_all(client_socket, msg, strlen(msg)); close(client_socket); return NULL; }
-
-        char path[512]; snprintf(path, sizeof(path), STORAGE_ROOT "/%s", fname);
-        FILE* f = fopen(path, "rb");
-        if (!f) { const char* msg = "ERROR: not found\n"; send_all(client_socket, msg, strlen(msg)); close(client_socket); return NULL; }
-        char buf[4096];
-        size_t nread;
-        while ((nread = fread(buf, 1, sizeof(buf), f)) > 0) {
-            if (!send_all(client_socket, buf, nread)) {
-                break;
-            }
-        }
-        fclose(f);
     }
 
     close(client_socket);
@@ -990,11 +1022,11 @@ void* handle_client_connections(void* arg) {
 
     // Create listening socket for Clients
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("[SS] Client socket creation failed");
+        LOGE_SS("Client socket creation failed: %s\n", strerror(errno));
         return NULL;
     }
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        perror("[SS] setsockopt");
+        LOGE_SS("setsockopt failed: %s\n", strerror(errno));
         return NULL;
     }
     address.sin_family = AF_INET;
@@ -1002,25 +1034,25 @@ void* handle_client_connections(void* arg) {
     address.sin_port = htons(client_listen_port);
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("[SS] Client socket bind failed");
+        LOGE_SS("Client socket bind failed: %s\n", strerror(errno));
         return NULL;
     }
     if (listen(server_fd, 5) < 0) {
-        perror("[SS] Client socket listen failed");
+        LOGE_SS("Client socket listen failed: %s\n", strerror(errno));
         return NULL;
     }
 
-    printf("[SS] Storage Server now listening for CLIENTS on port %d...\n",
+    LOG_SS("Storage Server now listening for CLIENTS on port %d...\n",
            client_listen_port);
 
     // --- Accept Loop for Clients ---
     while (true) {
         int client_socket;
         if ((client_socket = accept(server_fd, NULL, NULL)) < 0) {
-            perror("[SS] Client accept failed");
+            LOGE_SS("Client accept failed: %s\n", strerror(errno));
             continue;
         }
-        printf("[SS] Received a direct client connection!\n");
+        LOG_SS("Received a direct client connection!\n");
 
         // Spawn a detached thread per client to handle header-based loop or legacy read
         pthread_t tid;
@@ -1028,7 +1060,7 @@ void* handle_client_connections(void* arg) {
         if (!a) { close(client_socket); continue; }
         a->client_socket = client_socket;
         if (pthread_create(&tid, NULL, handle_one_client, a) != 0) {
-            perror("[SS] pthread_create (client session)");
+            LOGE_SS("pthread_create (client session) failed: %s\n", strerror(errno));
             close(client_socket);
             free(a);
             continue;
@@ -1058,11 +1090,11 @@ void* listen_to_nm(void* arg) {
     // Loop forever, waiting for commands from the NM
     while (true) {
         if (!recv_all(nm_socket, &header, sizeof(MsgHeader))) {
-            fprintf(stderr, "[SS] Connection to Name Server lost! Exiting.\n");
+            LOGE_SS("Connection to Name Server lost! Exiting.\n");
             exit(EXIT_FAILURE); // If NM is down, SS can't function
         }
 
-        printf("[SS] Received command %d from Name Server.\n", header.command);
+        LOG_SS("Received command %d from Name Server.\n", header.command);
         
         // Handle commands from NM
     switch (header.command) {
@@ -1079,11 +1111,11 @@ void* listen_to_nm(void* arg) {
                 char err[256] = {0};
                 int rc = ss_create_file_do(&msg, err, sizeof(err));
                 if (rc == 0) {
-                    printf("[SS] Created file '%s' for owner '%s'\n", msg.filename, msg.owner);
+                    LOG_SS("Created file '%s' for owner '%s'\n", msg.filename, msg.owner);
                     MsgHeader ack = { .command = CMD_ACK, .payload_size = 0 };
                     send_all(nm_socket, &ack, sizeof(ack));
                 } else {
-                    printf("[SS] CREATE failed for '%s': %s\n", msg.filename, err);
+                    LOGE_SS("CREATE failed for '%s': %s\n", msg.filename, err);
                     nm_send_error(409, err[0] ? err : "CREATE failed");
                 }
                 break;
@@ -1144,6 +1176,11 @@ void* listen_to_nm(void* arg) {
                     nm_send_error(400, "Payload read failed");
                     break;
                 }
+                // Reject delete if any active sentence lock exists for this file
+                if (sentence_lock_any_for_file(msg.filename)) {
+                    nm_send_error(423, "File has active write lock");
+                    break;
+                }
                 // Enforce owner-only delete
                 char meta[512]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", msg.filename);
                 FILE* mf = fopen(meta, "r");
@@ -1159,11 +1196,11 @@ void* listen_to_nm(void* arg) {
                 }
                 int rc = ss_delete_file_do(msg.filename);
                 if (rc == 0) {
-                    printf("[SS] Deleted file '%s'\n", msg.filename);
+                    LOG_SS("Deleted file '%s'\n", msg.filename);
                     MsgHeader ack = { .command = CMD_ACK, .payload_size = 0 };
                     send_all(nm_socket, &ack, sizeof(ack));
                 } else {
-                    printf("[SS] DELETE failed for '%s'\n", msg.filename);
+                    LOGE_SS("DELETE failed for '%s'\n", msg.filename);
                     nm_send_error(404, "DELETE failed");
                 }
                 break;
@@ -1342,14 +1379,17 @@ void* listen_to_nm(void* arg) {
 }
 
 int main(int argc, char const *argv[]) {
+    // Avoid termination on broken pipe when NM disconnects
+    signal(SIGPIPE, SIG_IGN);
+
     if (argc != 2) {
-        fprintf(stderr, "Usage: %s <client_listen_port>\n", argv[0]);
+    LOGE_SS("Usage: %s <client_listen_port>\n", argv[0]);
         return 1;
     }
 
     client_listen_port = atoi(argv[1]);
     if (client_listen_port <= 0 || client_listen_port > 65535) {
-        fprintf(stderr, "Invalid port number.\n");
+    LOGE_SS("Invalid port number.\n");
         return 1;
     }
 
@@ -1376,18 +1416,18 @@ int main(int argc, char const *argv[]) {
         return 1;
     }
 
-    printf("[SS] Connecting to Name Server at 127.0.0.1:%d...\n", NAME_SERVER_PORT);
+    LOG_SS("Connecting to Name Server at 127.0.0.1:%d...\n", NAME_SERVER_PORT);
 
     if (connect(nm_socket, (struct sockaddr *)&nm_address, sizeof(nm_address)) < 0) {
         perror("[SS] Connection Failed");
         return 1;
     }
 
-    printf("[SS] Connected to Name Server!\n");
+    LOG_SS("Connected to Name Server!\n");
 
     // Ensure storage root exists
     if (ensure_dir(STORAGE_ROOT) != 0) {
-        fprintf(stderr, "[SS] Failed to ensure storage root '%s'\n", STORAGE_ROOT);
+    LOGE_SS("Failed to ensure storage root '%s'\n", STORAGE_ROOT);
         return 1;
     }
 
@@ -1399,7 +1439,7 @@ int main(int argc, char const *argv[]) {
     header.payload_size = sizeof(MsgRegisterSS);
     reg_msg.client_listen_port = client_listen_port;
 
-    printf("[SS] Registering with NM (Client Port: %d)...\n", client_listen_port);
+    LOG_SS("Registering with NM (Client Port: %d)...\n", client_listen_port);
 
     // Send header, then payload
     if (!send_all(nm_socket, &header, sizeof(MsgHeader))) return 1;
@@ -1408,14 +1448,14 @@ int main(int argc, char const *argv[]) {
 
     // --- Wait for ACK ---
     if (!recv_all(nm_socket, &header, sizeof(MsgHeader))) {
-        fprintf(stderr, "[SS] Failed to receive ACK from NM.\n");
+    LOGE_SS("Failed to receive ACK from NM.\n");
         return 1;
     }
 
     if (header.command == CMD_ACK) {
-        printf("[SS] Registration successful!\n");
+    LOG_SS("Registration successful!\n");
     } else {
-        fprintf(stderr, "[SS] Registration failed (Received command %d).\n", header.command);
+    LOGE_SS("Registration failed (Received command %d).\n", header.command);
         return 1;
     }
     
