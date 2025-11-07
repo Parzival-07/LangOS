@@ -9,6 +9,8 @@
 #include <sys/socket.h>
 #include <poll.h>
 #include <strings.h>
+#include <signal.h>
+#include <errno.h>
 
 int nm_socket;
 char username[MAX_USERNAME_LEN];
@@ -25,16 +27,16 @@ void* nm_watchdog(void* arg) {
 
         int r = poll(&pfd, 1, 500); // 500ms heartbeat
         if (r < 0) {
-            perror("[Client] poll");
+            LOGE_CLIENT("poll failed: %s\n", strerror(errno));
             // On poll error, be conservative and exit
-            fprintf(stderr, "\n[Client] NM watchdog exiting due to poll error.\n");
+            LOGE_CLIENT("NM watchdog exiting due to poll error.\n");
             _exit(1);
         }
         if (r == 0) {
             continue; // timeout, loop again
         }
         if (pfd.revents & (POLLHUP | POLLERR)) {
-            fprintf(stderr, "\n[Client] Name Server connection closed. Exiting.\n");
+            LOGE_CLIENT("Name Server connection closed. Exiting.\n");
             _exit(1);
         }
         if (pfd.revents & POLLIN) {
@@ -42,7 +44,7 @@ void* nm_watchdog(void* arg) {
             char ch;
             ssize_t n = recv(nm_socket, &ch, 1, MSG_PEEK);
             if (n == 0) {
-                fprintf(stderr, "\n[Client] Name Server disconnected. Exiting.\n");
+                LOGE_CLIENT("Name Server disconnected. Exiting.\n");
                 _exit(1);
             }
             // n > 0 means data pending; ignore (main thread will read it)
@@ -69,39 +71,42 @@ static char* safe_strdup(const char* s) {
 }
 
 int main() {
+    // Ensure sends to closed sockets don't kill the client process
+    signal(SIGPIPE, SIG_IGN);
+
     // --- Get Username ---
     printf("Enter your username: ");
     if (fgets(username, MAX_USERNAME_LEN, stdin) == NULL) {
-        fprintf(stderr, "Error reading username.\n");
+    LOGE_CLIENT("Error reading username.\n");
         return 1;
     }
     remove_newline(username);
     
     if (strlen(username) == 0) {
-        fprintf(stderr, "Invalid username.\n");
+    LOGE_CLIENT("Invalid username.\n");
         return 1;
     }
 
     // --- Connect to Name Server ---
     struct sockaddr_in nm_address;
     if ((nm_socket = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("[Client] Socket creation error");
+        LOGE_CLIENT("Socket creation error: %s\n", strerror(errno));
         return 1;
     }
 
     nm_address.sin_family = AF_INET;
     nm_address.sin_port = htons(NAME_SERVER_PORT);
     if (inet_pton(AF_INET, "127.0.0.1", &nm_address.sin_addr) <= 0) {
-        perror("[Client] Invalid address");
+        LOGE_CLIENT("Invalid address\n");
         return 1;
     }
 
-    printf("[Client] Connecting to Name Server...\n");
+    LOG_CLIENT("Connecting to Name Server...\n");
     if (connect(nm_socket, (struct sockaddr *)&nm_address, sizeof(nm_address)) < 0) {
-        perror("[Client] Connection Failed");
+        LOGE_CLIENT("Connection Failed: %s\n", strerror(errno));
         return 1;
     }
-    printf("[Client] Connected to Name Server!\n");
+    LOG_CLIENT("Connected to Name Server!\n");
 
     // --- Register with Name Server ---
     MsgHeader header;
@@ -111,26 +116,26 @@ int main() {
     header.payload_size = sizeof(MsgRegisterClient);
     strncpy(reg_msg.username, username, MAX_USERNAME_LEN);
 
-    printf("[Client] Registering as '%s'...\n", username);
+    LOG_CLIENT("Registering as '%s'...\n", username);
     if (!send_all(nm_socket, &header, sizeof(MsgHeader))) return 1;
     if (!send_all(nm_socket, &reg_msg, sizeof(MsgRegisterClient))) return 1;
     
     // --- Wait for ACK ---
     if (!recv_all(nm_socket, &header, sizeof(MsgHeader))) {
-        fprintf(stderr, "[Client] Failed to receive ACK from NM.\n");
+        LOGE_CLIENT("Failed to receive ACK from NM.\n");
         return 1;
     }
     if (header.command == CMD_ACK) {
-        printf("[Client] Registration successful!\n");
+        LOG_CLIENT("Registration successful!\n");
     } else {
-        fprintf(stderr, "[Client] Registration failed.\n");
+        LOGE_CLIENT("Registration failed.\n");
         return 1;
     }
 
     // --- Start NM disconnect watchdog (proactive exit on NM down) ---
     pthread_t wd_thread_id;
     if (pthread_create(&wd_thread_id, NULL, nm_watchdog, NULL) != 0) {
-        perror("[Client] Failed to create NM watchdog thread");
+        LOGE_CLIENT("Failed to create NM watchdog thread: %s\n", strerror(errno));
         // Non-fatal: client will still exit on next NM interaction
     } else {
         pthread_detach(wd_thread_id);
@@ -175,14 +180,14 @@ int main() {
 
             if (!send_all(nm_socket, &h, sizeof(h)) ||
                 !send_all(nm_socket, &payload, sizeof(payload))) {
-                fprintf(stderr, "[Client] Failed to send CREATE to NM.\n");
+                LOGE_CLIENT("Failed to send CREATE to NM.\n");
                 continue;
             }
 
             // Wait for NM response
             MsgHeader rh;
             if (!recv_all(nm_socket, &rh, sizeof(rh))) {
-                fprintf(stderr, "[Client] No response from NM.\n");
+                LOGE_CLIENT("No response from NM.\n");
                 break; // Exit immediately on NM disconnect
             }
 
@@ -216,14 +221,14 @@ int main() {
 
             if (!send_all(nm_socket, &h, sizeof(h)) ||
                 !send_all(nm_socket, &payload, sizeof(payload))) {
-                fprintf(stderr, "[Client] Failed to send DELETE to NM.\n");
+                LOGE_CLIENT("Failed to send DELETE to NM.\n");
                 continue;
             }
 
             // Wait for NM response
             MsgHeader rh;
             if (!recv_all(nm_socket, &rh, sizeof(rh))) {
-                fprintf(stderr, "[Client] No response from NM.\n");
+                LOGE_CLIENT("No response from NM.\n");
                 break; // Exit immediately on NM disconnect
             }
 
@@ -242,8 +247,8 @@ int main() {
             }
         } else if (strcmp(command, "VIEW") == 0) {
             // VIEW flags: -a (all), -l (long listing). Accept combinations: -a, -l, -al, -la
-            // Default behavior: show all files so users can discover files (even without access)
-            int show_all = 1, long_list = 0;
+            // Default behavior (per spec): list only files the user has access to
+            int show_all = 0, long_list = 0;
             char* flag = strtok(NULL, " ");
             if (flag) {
                 if (strcmp(flag, "-a") == 0) { show_all = 1; }
@@ -263,21 +268,21 @@ int main() {
             h.payload_size = sizeof(rq);
 
             if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &rq, sizeof(rq))) {
-                fprintf(stderr, "[Client] Failed to send VIEW to NM.\n");
+                LOGE_CLIENT("Failed to send VIEW to NM.\n");
                 continue;
             }
 
             // Wait for NM response
             MsgHeader rh;
             if (!recv_all(nm_socket, &rh, sizeof(rh))) {
-                fprintf(stderr, "[Client] No response from NM.\n");
+                LOGE_CLIENT("No response from NM.\n");
                 break; // Exit immediately on NM disconnect
             }
 
             if (rh.command == CMD_VIEW_FILES_RESP && rh.payload_size == sizeof(MsgViewFilesResponse)) {
                 MsgViewFilesResponse resp = {0};
                 if (!recv_all(nm_socket, &resp, sizeof(resp))) {
-                    fprintf(stderr, "[Client] Failed to read VIEW payload.\n");
+                    LOGE_CLIENT("Failed to read VIEW payload.\n");
                     break; // Treat as NM disconnect and exit
                 }
                 if (resp.file_list[0] == '\0') {
@@ -322,11 +327,11 @@ int main() {
             strncpy(req.filename, fname, MAX_FILENAME_LEN - 1);
             strncpy(req.requester, username, MAX_USERNAME_LEN - 1);
             if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &req, sizeof(req))) {
-                fprintf(stderr, "[Client] Failed to query NM for file location.\n");
+                LOGE_CLIENT("Failed to query NM for file location.\n");
                 continue;
             }
             MsgHeader rh;
-            if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] NM no response.\n"); continue; }
+            if (!recv_all(nm_socket, &rh, sizeof(rh))) { LOGE_CLIENT("NM no response.\n"); continue; }
             if (rh.command != CMD_READ_FILE_RESP || rh.payload_size != sizeof(MsgReadFileResponse)) {
                 // Drain
                 size_t rem = rh.payload_size; char drain[256];
@@ -335,7 +340,7 @@ int main() {
                 continue;
             }
             MsgReadFileResponse addr = {0};
-            if (!recv_all(nm_socket, &addr, sizeof(addr))) { fprintf(stderr, "[Client] Failed reading location.\n"); continue; }
+            if (!recv_all(nm_socket, &addr, sizeof(addr))) { LOGE_CLIENT("Failed reading location.\n"); continue; }
             if (!addr.found) { printf("[Client] File not found.\n"); continue; }
 
             // Connect to SS (header-based protocol)
@@ -349,8 +354,8 @@ int main() {
             // Acquire lock: CMD_WRITE_BEGIN
             MsgWriteBegin begin = (MsgWriteBegin){0}; strncpy(begin.filename, fname, MAX_FILENAME_LEN - 1); begin.sentence_index = sidx; strncpy(begin.requester, username, MAX_USERNAME_LEN - 1);
             MsgHeader bh = { .command = CMD_WRITE_BEGIN, .payload_size = sizeof(begin) };
-            if (!send_all(ss_fd, &bh, sizeof(bh)) || !send_all(ss_fd, &begin, sizeof(begin))) { fprintf(stderr, "[Client] Failed to send WRITE_BEGIN.\n"); close(ss_fd); continue; }
-            MsgHeader brh; if (!recv_all(ss_fd, &brh, sizeof(brh))) { fprintf(stderr, "[Client] No response for WRITE_BEGIN.\n"); close(ss_fd); continue; }
+            if (!send_all(ss_fd, &bh, sizeof(bh)) || !send_all(ss_fd, &begin, sizeof(begin))) { LOGE_CLIENT("Failed to send WRITE_BEGIN.\n"); close(ss_fd); continue; }
+            MsgHeader brh; if (!recv_all(ss_fd, &brh, sizeof(brh))) { LOGE_CLIENT("No response for WRITE_BEGIN.\n"); close(ss_fd); continue; }
             if (brh.command == CMD_ERROR && brh.payload_size == sizeof(MsgError)) {
                 MsgError err; recv_all(ss_fd, &err, sizeof(err)); printf("[Client] WRITE_BEGIN failed (%d): %s\n", err.code, err.message); close(ss_fd); continue;
             } else if (brh.command != CMD_ACK) {
@@ -361,12 +366,12 @@ int main() {
 
             // Fetch the file content from SS to build a working copy of the target sentence
             MsgHeader rqh = (MsgHeader){ .command = CMD_READ_FILE, .payload_size = sizeof(MsgReadFile) };
-            if (!send_all(ss_fd, &rqh, sizeof(rqh)) || !send_all(ss_fd, &req, sizeof(req))) { fprintf(stderr, "[Client] Failed to request file from SS.\n"); goto write_cancel_release; }
-            MsgHeader rrh; if (!recv_all(ss_fd, &rrh, sizeof(rrh))) { fprintf(stderr, "[Client] No READ response from SS.\n"); goto write_cancel_release; }
+            if (!send_all(ss_fd, &rqh, sizeof(rqh)) || !send_all(ss_fd, &req, sizeof(req))) { LOGE_CLIENT("Failed to request file from SS.\n"); goto write_cancel_release; }
+            MsgHeader rrh; if (!recv_all(ss_fd, &rrh, sizeof(rrh))) { LOGE_CLIENT("No READ response from SS.\n"); goto write_cancel_release; }
             if (rrh.command == CMD_ERROR && rrh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(ss_fd, &err, sizeof(err)); printf("[Client] READ failed (%d): %s\n", err.code, err.message); goto write_cancel_release; }
             if (rrh.command != CMD_ACK || rrh.payload_size < 0) { printf("[Client] Unexpected READ response (%d).\n", rrh.command); goto write_cancel_release; }
-            int fsize = rrh.payload_size; char* filebuf = (char*)malloc((size_t)fsize + 1); if (!filebuf) { fprintf(stderr, "[Client] OOM.\n"); goto write_cancel_release; }
-            if (fsize > 0 && !recv_all(ss_fd, filebuf, (size_t)fsize)) { fprintf(stderr, "[Client] Failed to receive file data.\n"); free(filebuf); goto write_cancel_release; }
+            int fsize = rrh.payload_size; char* filebuf = (char*)malloc((size_t)fsize + 1); if (!filebuf) { LOGE_CLIENT("OOM.\n"); goto write_cancel_release; }
+            if (fsize > 0 && !recv_all(ss_fd, filebuf, (size_t)fsize)) { LOGE_CLIENT("Failed to receive file data.\n"); free(filebuf); goto write_cancel_release; }
             filebuf[fsize] = '\0';
 
             // Parse into sentences ('.', '!', '?'), including trailing whitespace as part of the sentence block
@@ -391,16 +396,16 @@ int main() {
 
             // Extract the sentence and tokenize by whitespace
             size_t slen = (s_end > s_begin ? (s_end - s_begin) : 0);
-            char* sentence = (char*)malloc(slen + 1); if (!sentence) { fprintf(stderr, "[Client] OOM.\n"); free(filebuf); goto write_cancel_release; }
+            char* sentence = (char*)malloc(slen + 1); if (!sentence) { LOGE_CLIENT("OOM.\n"); free(filebuf); goto write_cancel_release; }
             memcpy(sentence, filebuf + s_begin, slen); sentence[slen] = '\0';
             free(filebuf);
 
             // Build vector of words
             char** words = NULL; int wcount = 0; size_t cap = 0;
-            char* tokbuf = safe_strdup(sentence); if (!tokbuf) { fprintf(stderr, "[Client] OOM.\n"); free(sentence); goto write_cancel_release; }
+            char* tokbuf = safe_strdup(sentence); if (!tokbuf) { LOGE_CLIENT("OOM.\n"); free(sentence); goto write_cancel_release; }
             char* saveptr = NULL; for (char* t = strtok_r(tokbuf, " \t\r\n", &saveptr); t; t = strtok_r(NULL, " \t\r\n", &saveptr)) {
-                if (wcount == (int)cap) { cap = cap ? cap*2 : 8; char** nw = realloc(words, cap * sizeof(char*)); if (!nw) { fprintf(stderr, "[Client] OOM.\n"); break; } words = nw; }
-                char* dup = safe_strdup(t); if (!dup) { fprintf(stderr, "[Client] OOM.\n"); break; }
+                if (wcount == (int)cap) { cap = cap ? cap*2 : 8; char** nw = realloc(words, cap * sizeof(char*)); if (!nw) { LOGE_CLIENT("OOM.\n"); break; } words = nw; }
+                char* dup = safe_strdup(t); if (!dup) { LOGE_CLIENT("OOM.\n"); break; }
                 words[wcount++] = dup;
             }
             free(tokbuf);
@@ -431,10 +436,10 @@ int main() {
                 // Split content into tokens (by whitespace) to allow multi-word insert/replace
                 // Build a temp array of tokens
                 char** newtoks = NULL; int nt = 0; size_t ncap = 0;
-                char* cdup = safe_strdup(content); if (!cdup) { fprintf(stderr, "[Client] OOM.\n"); continue; }
+                char* cdup = safe_strdup(content); if (!cdup) { LOGE_CLIENT("OOM.\n"); continue; }
                 char* csp = NULL; for (char* ct = strtok_r(cdup, " \t\r\n", &csp); ct; ct = strtok_r(NULL, " \t\r\n", &csp)) {
-                    if (nt == (int)ncap) { ncap = ncap ? ncap*2 : 4; char** narr = realloc(newtoks, ncap * sizeof(char*)); if (!narr) { fprintf(stderr, "[Client] OOM.\n"); nt = -1; break; } newtoks = narr; }
-                    char* d = safe_strdup(ct); if (!d) { fprintf(stderr, "[Client] OOM.\n"); nt = -1; break; }
+                    if (nt == (int)ncap) { ncap = ncap ? ncap*2 : 4; char** narr = realloc(newtoks, ncap * sizeof(char*)); if (!narr) { LOGE_CLIENT("OOM.\n"); nt = -1; break; } newtoks = narr; }
+                    char* d = safe_strdup(ct); if (!d) { LOGE_CLIENT("OOM.\n"); nt = -1; break; }
                     newtoks[nt++] = d;
                 }
                 free(cdup);
@@ -451,7 +456,7 @@ int main() {
                     if (nt == 0) { /* no-op */ }
                     else {
                         // ensure capacity
-                        if (wcount + nt > (int)cap) { size_t need = (size_t)wcount + (size_t)nt; size_t ncap2 = cap ? cap : 8; while (ncap2 < need) ncap2 *= 2; char** narr = realloc(words, ncap2 * sizeof(char*)); if (!narr) { fprintf(stderr, "[Client] OOM.\n"); goto free_newtoks; } words = narr; cap = ncap2; }
+                        if (wcount + nt > (int)cap) { size_t need = (size_t)wcount + (size_t)nt; size_t ncap2 = cap ? cap : 8; while (ncap2 < need) ncap2 *= 2; char** narr = realloc(words, ncap2 * sizeof(char*)); if (!narr) { LOGE_CLIENT("OOM.\n"); goto free_newtoks; } words = narr; cap = ncap2; }
                         for (int k = 0; k < nt; k++) words[wcount++] = newtoks[k], newtoks[k] = NULL;
                     }
                 } else if (idx1 >= 1 && idx1 <= wcount) {
@@ -464,7 +469,7 @@ int main() {
                     } else {
                         int tail = wcount - (pos + 1);
                         // ensure capacity
-                        if ((size_t)(wcount - 1 + nt) > cap) { size_t need = (size_t)wcount - 1 + (size_t)nt; size_t ncap2 = cap ? cap : 8; while (ncap2 < need) ncap2 *= 2; char** narr = realloc(words, ncap2 * sizeof(char*)); if (!narr) { fprintf(stderr, "[Client] OOM.\n"); goto free_newtoks; } words = narr; cap = ncap2; }
+                        if ((size_t)(wcount - 1 + nt) > cap) { size_t need = (size_t)wcount - 1 + (size_t)nt; size_t ncap2 = cap ? cap : 8; while (ncap2 < need) ncap2 *= 2; char** narr = realloc(words, ncap2 * sizeof(char*)); if (!narr) { LOGE_CLIENT("OOM.\n"); goto free_newtoks; } words = narr; cap = ncap2; }
                         // make room: move tail right by (nt-1)
                         if (tail > 0) memmove(&words[pos + nt], &words[pos + 1], (size_t)tail * sizeof(char*));
                         // place new tokens
@@ -508,9 +513,9 @@ free_newtoks:
                 strncpy(w.requester, username, MAX_USERNAME_LEN - 1);
                 MsgHeader wh = { .command = CMD_WRITE_FILE, .payload_size = sizeof(w) };
                 if (!send_all(ss_fd, &wh, sizeof(wh)) || !send_all(ss_fd, &w, sizeof(w))) {
-                    fprintf(stderr, "[Client] Failed to send WRITE.\n");
+                    LOGE_CLIENT("Failed to send WRITE.\n");
                 } else {
-                    MsgHeader wr; if (!recv_all(ss_fd, &wr, sizeof(wr))) { fprintf(stderr, "[Client] No response to WRITE.\n"); }
+                    MsgHeader wr; if (!recv_all(ss_fd, &wr, sizeof(wr))) { LOGE_CLIENT("No response to WRITE.\n"); }
                     else if (wr.command == CMD_ERROR && wr.payload_size == sizeof(MsgError)) { MsgError err; recv_all(ss_fd, &err, sizeof(err)); printf("[Client] WRITE failed (%d): %s\n", err.code, err.message); }
                     else if (wr.command != CMD_ACK) { printf("[Client] Unexpected response to WRITE (%d).\n", wr.command); }
                     else { printf("[Client] WRITE applied.\n"); }
@@ -584,10 +589,10 @@ write_cancel_release:
             ac.is_writer = 0; // ignored by server on removal
             MsgHeader h = { .command = CMD_REM_ACCESS, .payload_size = sizeof(ac) };
             if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &ac, sizeof(ac))) {
-                fprintf(stderr, "[Client] Failed to send REMACCESS.\n");
+                LOGE_CLIENT("Failed to send REMACCESS.\n");
                 continue;
             }
-            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] NM disconnected.\n"); break; }
+            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { LOGE_CLIENT("NM disconnected.\n"); break; }
             if (rh.command == CMD_ACK) printf("[Client] Access removed.\n");
             else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(nm_socket, &err, sizeof(err)); printf("[Client] REMACCESS failed (%d): %s\n", err.code, err.message); }
             else printf("[Client] Unexpected response (%d).\n", rh.command);
@@ -598,10 +603,10 @@ write_cancel_release:
             strncpy(rq.filename, fname, MAX_FILENAME_LEN-1);
             MsgHeader h = { .command = CMD_INFO, .payload_size = sizeof(rq) };
             if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &rq, sizeof(rq))) {
-                fprintf(stderr, "[Client] Failed to send INFO.\n");
+                LOGE_CLIENT("Failed to send INFO.\n");
                 continue;
             }
-            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] NM disconnected.\n"); break; }
+            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { LOGE_CLIENT("NM disconnected.\n"); break; }
             if (rh.command == CMD_INFO_RESP && rh.payload_size == sizeof(MsgInfoResponse)) {
                 MsgInfoResponse resp; if (recv_all(nm_socket, &resp, sizeof(resp))) { printf("%s\n", resp.info); }
             } else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) {
@@ -619,10 +624,10 @@ write_cancel_release:
             strncpy(rq.requester, username, MAX_USERNAME_LEN-1);
             MsgHeader h = { .command = CMD_UNDO, .payload_size = sizeof(rq) };
             if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &rq, sizeof(rq))) {
-                fprintf(stderr, "[Client] Failed to send UNDO.\n");
+                LOGE_CLIENT("Failed to send UNDO.\n");
                 continue;
             }
-            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] NM disconnected.\n"); break; }
+            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { LOGE_CLIENT("NM disconnected.\n"); break; }
             if (rh.command == CMD_ACK) {
                 printf("[Client] Undo applied to '%s'.\n", fname);
             } else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) {
@@ -650,13 +655,13 @@ write_cancel_release:
             strncpy(req.requester, username, MAX_USERNAME_LEN - 1);
 
             if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &req, sizeof(req))) {
-                fprintf(stderr, "[Client] Failed to send READ to NM.\n");
+                LOGE_CLIENT("Failed to send READ to NM.\n");
                 continue;
             }
 
             MsgHeader rh;
             if (!recv_all(nm_socket, &rh, sizeof(rh))) {
-                fprintf(stderr, "[Client] No response from NM.\n");
+                LOGE_CLIENT("No response from NM.\n");
                 break; // Exit immediately on NM disconnect
             }
             if (rh.command != CMD_READ_FILE_RESP || rh.payload_size != sizeof(MsgReadFileResponse)) {
@@ -669,7 +674,7 @@ write_cancel_release:
 
             MsgReadFileResponse addr = {0};
             if (!recv_all(nm_socket, &addr, sizeof(addr))) {
-                fprintf(stderr, "[Client] Failed to read READ response payload.\n");
+                LOGE_CLIENT("Failed to read READ response payload.\n");
                 break; // Treat as NM disconnect and exit
             }
             if (!addr.found || addr.ss_port <= 0 || addr.ss_ip[0] == '\0') {
@@ -689,27 +694,57 @@ write_cancel_release:
             if (connect(ss_fd, (struct sockaddr*)&ss_addr, sizeof(ss_addr)) < 0) {
                 perror("[Client] connect to SS"); close(ss_fd); continue;
             }
-
-            // Send username and filename on two lines for ACL-aware simple protocol
-            size_t ulen = strnlen(username, MAX_USERNAME_LEN);
-            size_t flen = strnlen(fname, MAX_FILENAME_LEN);
-            if (!send_all(ss_fd, username, ulen) || !send_all(ss_fd, "\n", 1) ||
-                !send_all(ss_fd, fname, flen) || !send_all(ss_fd, "\n", 1)) {
-                fprintf(stderr, "[Client] Failed to send filename to SS.\n");
-                close(ss_fd); continue;
+            // Header-based READ: send CMD_READ_FILE with requester for ACL
+            {
+                MsgReadFile rreq = (MsgReadFile){0};
+                strncpy(rreq.filename, fname, MAX_FILENAME_LEN - 1);
+                strncpy(rreq.requester, username, MAX_USERNAME_LEN - 1);
+                MsgHeader rhdr = (MsgHeader){ .command = CMD_READ_FILE, .payload_size = sizeof(rreq) };
+                if (!send_all(ss_fd, &rhdr, sizeof(rhdr)) || !send_all(ss_fd, &rreq, sizeof(rreq))) {
+                    LOGE_CLIENT("Failed to send READ to SS.\n");
+                    close(ss_fd); continue;
+                }
+                MsgHeader rresp;
+                if (!recv_all(ss_fd, &rresp, sizeof(rresp))) {
+                    LOGE_CLIENT("No response from SS.\n");
+                    close(ss_fd); continue;
+                }
+                if (rresp.command == CMD_ERROR && rresp.payload_size == sizeof(MsgError)) {
+                    MsgError err; if (recv_all(ss_fd, &err, sizeof(err))) {
+                        printf("[Client] READ failed (%d): %s\n", err.code, err.message);
+                    } else {
+                        printf("[Client] READ failed (unknown error).\n");
+                    }
+                    close(ss_fd);
+                    continue;
+                }
+                if (rresp.command != CMD_ACK || rresp.payload_size < 0) {
+                    // Drain any unexpected payload and report
+                    size_t rem = rresp.payload_size; char drain[512];
+                    while (rem > 0) { size_t ch = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(ss_fd, drain, ch)) break; rem -= ch; }
+                    printf("[Client] Unexpected response from SS (%d).\n", rresp.command);
+                    close(ss_fd); continue;
+                }
+                int nbytes = rresp.payload_size;
+                if (nbytes > 0) {
+                    char* cbuf = (char*)malloc((size_t)nbytes + 1);
+                    if (!cbuf) { LOGE_CLIENT("OOM.\n"); close(ss_fd); continue; }
+                    if (!recv_all(ss_fd, cbuf, (size_t)nbytes)) {
+                        LOGE_CLIENT("Failed to receive file content.\n");
+                        free(cbuf); close(ss_fd); continue;
+                    }
+                    cbuf[nbytes] = '\0';
+                    fwrite(cbuf, 1, (size_t)nbytes, stdout);
+                    // Ensure a trailing newline for cleanliness
+                    if (nbytes > 0 && cbuf[nbytes-1] != '\n') putchar('\n');
+                    free(cbuf);
+                } else {
+                    // Empty file; still print a newline for UX
+                    putchar('\n');
+                }
+                close(ss_fd);
             }
-
-            // Read all content until EOF and print
-            char buf[4096];
-            ssize_t n;
-            while ((n = recv(ss_fd, buf, sizeof(buf), 0)) > 0) {
-                fwrite(buf, 1, (size_t)n, stdout);
-            }
-            if (n < 0) perror("[Client] recv from SS");
-            // Ensure a trailing newline for cleanliness
-            if (flen > 0) printf("\n");
-            close(ss_fd);
-        } else if (strcmp(command, "STREAM") == 0) {
+    } else if (strcmp(command, "STREAM") == 0) {
             char* fname = strtok(NULL, " ");
             if (!fname) { printf("[Client] Usage: STREAM <filename>\n"); continue; }
 
@@ -720,17 +755,17 @@ write_cancel_release:
             strncpy(req.filename, fname, MAX_FILENAME_LEN - 1);
             strncpy(req.requester, username, MAX_USERNAME_LEN - 1);
             if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &req, sizeof(req))) {
-                fprintf(stderr, "[Client] Failed to send STREAM routing query.\n");
+                LOGE_CLIENT("Failed to send STREAM routing query.\n");
                 continue;
             }
-            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] NM disconnected.\n"); break; }
+            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { LOGE_CLIENT("NM disconnected.\n"); break; }
             if (rh.command != CMD_READ_FILE_RESP || rh.payload_size != sizeof(MsgReadFileResponse)) {
                 // Drain unexpected
                 size_t rem = rh.payload_size; char drain[256]; while (rem > 0) { size_t ch = rem>sizeof(drain)?sizeof(drain):rem; if (!recv_all(nm_socket, drain, ch)) break; rem -= ch; }
                 printf("[Client] Unexpected NM response to STREAM routing (%d).\n", rh.command);
                 continue;
             }
-            MsgReadFileResponse addr = {0}; if (!recv_all(nm_socket, &addr, sizeof(addr))) { fprintf(stderr, "[Client] Failed reading routing payload.\n"); break; }
+            MsgReadFileResponse addr = {0}; if (!recv_all(nm_socket, &addr, sizeof(addr))) { LOGE_CLIENT("Failed reading routing payload.\n"); break; }
             if (!addr.found) { printf("[Client] STREAM failed: file not found.\n"); continue; }
 
             // Connect to Storage Server
@@ -741,49 +776,73 @@ write_cancel_release:
             if (inet_pton(AF_INET, addr.ss_ip, &ss_addr.sin_addr) <= 0) { perror("[Client] inet_pton"); close(ss_fd); continue; }
             if (connect(ss_fd, (struct sockaddr*)&ss_addr, sizeof(ss_addr)) < 0) { perror("[Client] connect to SS"); close(ss_fd); continue; }
 
-            // Request file via header-based READ (so ACL is enforced)
-            MsgHeader rq = (MsgHeader){ .command = CMD_READ_FILE, .payload_size = sizeof(MsgReadFile) };
-            if (!send_all(ss_fd, &rq, sizeof(rq)) || !send_all(ss_fd, &req, sizeof(req))) { fprintf(stderr, "[Client] STREAM: failed to request file from SS.\n"); close(ss_fd); continue; }
-            MsgHeader rrh; if (!recv_all(ss_fd, &rrh, sizeof(rrh))) { fprintf(stderr, "[Client] STREAM: no READ response from SS.\n"); close(ss_fd); continue; }
-            if (rrh.command == CMD_ERROR && rrh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(ss_fd, &err, sizeof(err)); printf("[Client] STREAM failed (%d): %s\n", err.code, err.message); close(ss_fd); continue; }
-            if (rrh.command != CMD_ACK || rrh.payload_size < 0) { printf("[Client] STREAM: unexpected READ response (%d).\n", rrh.command); close(ss_fd); continue; }
-
-            int fsize = rrh.payload_size;
-            char* filebuf = (char*)malloc((size_t)fsize + 1);
-            if (!filebuf) { fprintf(stderr, "[Client] STREAM: OOM.\n"); close(ss_fd); continue; }
-            if (fsize > 0 && !recv_all(ss_fd, filebuf, (size_t)fsize)) { fprintf(stderr, "[Client] STREAM: failed to receive file data.\n"); free(filebuf); close(ss_fd); continue; }
-            filebuf[fsize] = '\0';
-            close(ss_fd);
-
-            // Stream word-by-word with 0.1s delay
-            char* ctx = NULL;
-            char* p = filebuf;
-            while (*p) {
-                // Skip leading whitespace
-                while (*p && (*p==' ' || *p=='\n' || *p=='\t' || *p=='\r' || *p=='\f' || *p=='\v')) p++;
-                if (!*p) break;
-                // Start of word
-                char* start = p;
-                while (*p && !(*p==' ' || *p=='\n' || *p=='\t' || *p=='\r' || *p=='\f' || *p=='\v')) p++;
-                size_t len = (size_t)(p - start);
-                if (len > 0) {
-                    fwrite(start, 1, len, stdout);
-                    fputc(' ', stdout);
-                    fflush(stdout);
-                    usleep(100000); // 0.1 seconds
+            // Request streaming via CMD_STREAM and read raw bytes while detecting STOP\n sentinel.
+            MsgStreamRequest sr = (MsgStreamRequest){0};
+            strncpy(sr.filename, fname, MAX_FILENAME_LEN-1);
+            strncpy(sr.requester, username, MAX_USERNAME_LEN-1);
+            MsgHeader sh = (MsgHeader){ .command = CMD_STREAM, .payload_size = sizeof(sr) };
+            if (!send_all(ss_fd, &sh, sizeof(sh)) || !send_all(ss_fd, &sr, sizeof(sr))) {
+                LOGE_CLIENT("STREAM: failed to send stream request.\n");
+                close(ss_fd);
+                continue;
+            }
+            // Peek to see if SS immediately responded with an error header.
+            // On success, SS streams raw bytes without a header; on failure it sends CMD_ERROR + MsgError.
+            {
+                MsgHeader peek;
+                ssize_t got = recv(ss_fd, &peek, sizeof(peek), MSG_PEEK);
+                if (got == (ssize_t)sizeof(peek) && peek.command == CMD_ERROR && peek.payload_size == (int)sizeof(MsgError)) {
+                    // Consume the error header and payload fully and report a clean message
+                    MsgHeader eh; MsgError err;
+                    if (recv_all(ss_fd, &eh, sizeof(eh)) && recv_all(ss_fd, &err, sizeof(err))) {
+                        printf("STREAM failed (%d): %s\n", err.code, err.message);
+                    } else {
+                        printf("STREAM failed: unknown error from Storage Server\n");
+                    }
+                    close(ss_fd);
+                    continue;
                 }
             }
-            // Finish with newline
-            printf("\n");
-            free(filebuf);
+            // Rolling STOP detection ("STOP\n"), printing all other bytes immediately.
+            int got_stop = 0;
+            char hold[5]; int hlen = 0; // keep last up to 5 bytes to match STOP\n
+            // Unbuffer stdout to see live output
+            setvbuf(stdout, NULL, _IONBF, 0);
+
+            char rbuf[1024];
+            while (!got_stop) {
+                ssize_t n = recv(ss_fd, rbuf, sizeof(rbuf), 0);
+                if (n <= 0) break;
+                for (ssize_t i = 0; i < n; ++i) {
+                    char ch = rbuf[i];
+                    if (hlen < 5) {
+                        hold[hlen++] = ch;
+                    } else {
+                        // print the oldest byte and shift
+                        fputc(hold[0], stdout);
+                        memmove(hold, hold+1, 4);
+                        hold[4] = ch;
+                    }
+                    if (hlen == 5 && memcmp(hold, "STOP\n", 5) == 0) {
+                        got_stop = 1;
+                        break;
+                    }
+                }
+            }
+            if (!got_stop) {
+                // flush any pending bytes
+                for (int i = 0; i < hlen; ++i) fputc(hold[i], stdout);
+                printf("\nError: Storage Server disconnected during streaming\n");
+            }
+            close(ss_fd);
         } else if (strcmp(command, "LIST") == 0) {
             // Request user list from Name Server
             MsgHeader h = (MsgHeader){ .command = CMD_LIST_USERS, .payload_size = 0 };
-            if (!send_all(nm_socket, &h, sizeof(h))) { fprintf(stderr, "[Client] Failed to send LIST.\n"); continue; }
-            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] NM disconnected.\n"); break; }
+            if (!send_all(nm_socket, &h, sizeof(h))) { LOGE_CLIENT("Failed to send LIST.\n"); continue; }
+            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { LOGE_CLIENT("NM disconnected.\n"); break; }
             if (rh.command == CMD_LIST_USERS_RESP && rh.payload_size == sizeof(MsgUsersListResponse)) {
                 MsgUsersListResponse resp = {0};
-                if (!recv_all(nm_socket, &resp, sizeof(resp))) { fprintf(stderr, "[Client] Failed to read LIST payload.\n"); break; }
+                if (!recv_all(nm_socket, &resp, sizeof(resp))) { LOGE_CLIENT("Failed to read LIST payload.\n"); break; }
                 if (resp.users[0] == '\0') { printf("[Client] No users currently registered.\n"); }
                 else { printf("%s", resp.users); }
             } else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) {
@@ -801,14 +860,14 @@ write_cancel_release:
             strncpy(rq.requester, username, MAX_USERNAME_LEN-1);
             MsgHeader h = { .command = CMD_EXEC, .payload_size = sizeof(rq) };
             if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &rq, sizeof(rq))) {
-                fprintf(stderr, "[Client] Failed to send EXEC.\n");
+                LOGE_CLIENT("Failed to send EXEC.\n");
                 continue;
             }
-            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { fprintf(stderr, "[Client] NM disconnected.\n"); break; }
+            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { LOGE_CLIENT("NM disconnected.\n"); break; }
             if (rh.command == CMD_ACK && rh.payload_size >= 0) {
                 int n = rh.payload_size; if (n > 0) {
-                    char* buf = (char*)malloc((size_t)n+1); if (!buf) { fprintf(stderr, "[Client] OOM.\n"); continue; }
-                    if (!recv_all(nm_socket, buf, (size_t)n)) { fprintf(stderr, "[Client] Failed to read EXEC output.\n"); free(buf); continue; }
+                    char* buf = (char*)malloc((size_t)n+1); if (!buf) { LOGE_CLIENT("OOM.\n"); continue; }
+                    if (!recv_all(nm_socket, buf, (size_t)n)) { LOGE_CLIENT("Failed to read EXEC output.\n"); free(buf); continue; }
                     buf[n] = '\0';
                     fwrite(buf, 1, (size_t)n, stdout);
                     // Ensure trailing newline for cleanliness if output didn't end with one

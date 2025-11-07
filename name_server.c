@@ -6,6 +6,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <ctype.h>
+#include <time.h>
+#include <signal.h>
 
 // --- CONFIGURATION ---
 #define MAX_CONNECTIONS 1024 // Max clients + storage servers
@@ -52,11 +55,45 @@ typedef struct {
     char filename[MAX_FILENAME_LEN];
     char owner[MAX_USERNAME_LEN];
     int ss_slot; // which storage server holds this file
+    // Cached metadata for INFO/VIEW (populated from SS during refresh)
+    long long created;
+    long long updated;
+    long long size_bytes;
+    long long words_cnt;
+    long long chars_cnt;
+    long long last_access;
+    long long last_modified;
+    char readers[1024];
+    char writers[1024];
+    char info_str[2048]; // raw INFO payload for direct responses
 } FileRecord;
 
 static FileRecord file_registry[MAX_FILES];
 static int file_count = 0;
 static pthread_mutex_t file_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// --- Small helpers ---
+// Check if a space-separated list contains a username (exact token match)
+static int nm_list_contains(const char* list, const char* user) {
+    if (!list || !user || !*user) return 0;
+    const unsigned char* p = (const unsigned char*)list;
+    // tokens are separated by commas and/or whitespace
+    while (*p) {
+        // skip separators
+        while (*p && (isspace(*p) || *p==',')) p++;
+        if (!*p) break;
+        char tok[MAX_USERNAME_LEN] = {0};
+        size_t k = 0;
+        while (*p && !(isspace(*p) || *p==',')) {
+            if (k + 1 < sizeof(tok)) tok[k++] = (char)*p;
+            p++;
+        }
+        tok[k] = '\0';
+        if (tok[0] && strncmp(tok, user, MAX_USERNAME_LEN) == 0) return 1;
+        // continue scanning from current p (which is at a separator)
+    }
+    return 0;
+}
 
 // --- PROTOTYPES ---
 void* handle_connection(void* arg);
@@ -68,6 +105,7 @@ static int choose_ss_slot(void);
 static void send_error(int socket, int code, const char* msg);
 static void registry_add_file_if_absent(const char* filename, const char* owner, int ss_slot);
 static void registry_refresh_from_ss(void);
+static void registry_update_one_from_ss(int ss_slot, const char* filename);
 
 // Helper: fetch file contents from SS using client port (header-based READ)
 static int nm_fetch_file_from_ss(const char* ss_ip, int ss_port, const char* filename, const char* requester, char** out_data, int* out_size) {
@@ -108,6 +146,9 @@ static int nm_fetch_file_from_ss(const char* ss_ip, int ss_port, const char* fil
 // --- MAIN SERVER LOGIC ---
 
 int main() {
+    // Ignore SIGPIPE globally so accidental sends to closed sockets don't kill the process
+    signal(SIGPIPE, SIG_IGN);
+
     int server_fd;
     struct sockaddr_in address;
     int opt = 1;
@@ -146,7 +187,7 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    printf("[NM] Name Server listening on port %d...\n", NAME_SERVER_PORT);
+    LOG_NM("Name Server listening on port %d...\n", NAME_SERVER_PORT);
 
     // --- MAIN ACCEPT LOOP ---
     while (true) {
@@ -169,7 +210,7 @@ int main() {
         args->socket = client_socket;
         inet_ntop(AF_INET, &client_address.sin_addr, args->ip_addr, INET_ADDRSTRLEN);
 
-        printf("[NM] New connection accepted from %s\n", args->ip_addr);
+    LOG_NM("New connection accepted from %s\n", args->ip_addr);
 
         // Create a new thread to handle this connection
         pthread_t thread_id;
@@ -213,7 +254,7 @@ void* handle_connection(void* arg) {
     pthread_mutex_unlock(&connections_mutex);
 
     if (slot == -1) {
-        fprintf(stderr, "[NM] Max connections reached. Rejecting %s.\n", ip);
+        LOGE_NM("Max connections reached. Rejecting %s.\n", ip);
         // TODO: Send CMD_ERROR (Server Busy)
         close(socket);
         return NULL;
@@ -222,7 +263,7 @@ void* handle_connection(void* arg) {
     MsgHeader header;
     // Read the first header to see who this is
     if (!recv_all(socket, &header, sizeof(MsgHeader))) {
-        fprintf(stderr, "[NM] Failed to read header from %s. Disconnecting.\n", ip);
+        LOGE_NM("Failed to read header from %s. Disconnecting.\n", ip);
         close(socket);
         // Free the slot
         pthread_mutex_lock(&connections_mutex);
@@ -238,7 +279,7 @@ void* handle_connection(void* arg) {
         case CMD_REGISTER_SS: {
             MsgRegisterSS msg;
             if (!recv_all(socket, &msg, sizeof(MsgRegisterSS))) {
-                fprintf(stderr, "[NM] Failed to read REG_SS payload from %s.\n", ip);
+                LOGE_NM("Failed to read REG_SS payload from %s.\n", ip);
                 registration_successful = false;
             } else {
                 handle_register_ss(slot, &msg);
@@ -248,7 +289,7 @@ void* handle_connection(void* arg) {
         case CMD_REGISTER_CLIENT: {
             MsgRegisterClient msg;
             if (!recv_all(socket, &msg, sizeof(MsgRegisterClient))) {
-                fprintf(stderr, "[NM] Failed to read REG_CLIENT payload from %s.\n", ip);
+                LOGE_NM("Failed to read REG_CLIENT payload from %s.\n", ip);
                 registration_successful = false;
             } else {
                 handle_register_client(slot, &msg);
@@ -256,7 +297,7 @@ void* handle_connection(void* arg) {
             break;
         }
         default:
-            fprintf(stderr, "[NM] Unknown command %d from %s.\n", header.command, ip);
+            LOGE_NM("Unknown command %d from %s.\n", header.command, ip);
             registration_successful = false;
             break;
     }
@@ -272,7 +313,7 @@ void* handle_connection(void* arg) {
     }
     
     // --- MAIN COMMAND LOOP for this connection ---
-    printf("[NM] Connection from %s (Socket %d, Slot %d) registered. Now in idle loop.\n", ip, socket, slot);
+    LOG_NM("Connection from %s (Socket %d, Slot %d) registered. Now in idle loop.\n", ip, socket, slot);
 
     // IMPORTANT: Do not read from SS sockets here, or you'll steal replies
     // that client threads are synchronously waiting to proxy.
@@ -284,7 +325,7 @@ void* handle_connection(void* arg) {
     }
 
     while (recv_all(socket, &header, sizeof(MsgHeader))) {
-        printf("[NM] Received command %d from socket %d (Slot %d)\n", header.command, socket, slot);
+        LOG_NM("Received command %d from socket %d (Slot %d)\n", header.command, socket, slot);
 
         // Handle selected commands here
         if (header.command == CMD_CREATE_FILE && connections[slot].type == CONN_TYPE_CLIENT) {
@@ -300,7 +341,7 @@ void* handle_connection(void* arg) {
 
             int ss_slot = choose_ss_slot();
             if (ss_slot < 0) {
-                printf("[NM] No Storage Server available for CREATE '%s'\n", payload.filename);
+                LOGE_NM("No Storage Server available for CREATE '%s'\n", payload.filename);
                 send_error(socket, 503, "No Storage Server available");
                 continue;
             }
@@ -310,8 +351,8 @@ void* handle_connection(void* arg) {
             pthread_mutex_lock(&connections_mutex);
             ss_sock = connections[ss_slot].socket;
             pthread_mutex_unlock(&connections_mutex);
-            printf("[NM] Forwarding CREATE '%s' (owner=%s) to SS at %s:%d (Slot %d)\n",
-                   payload.filename, payload.owner, connections[ss_slot].ip_addr, connections[ss_slot].client_port, ss_slot);
+         LOG_NM("Forwarding CREATE '%s' (owner=%s) to SS at %s:%d (Slot %d)\n",
+             payload.filename, payload.owner, connections[ss_slot].ip_addr, connections[ss_slot].client_port, ss_slot);
 
             pthread_mutex_lock(&connections[ss_slot].ss_io_mutex);
             MsgHeader ss_resp;
@@ -361,10 +402,11 @@ void* handle_connection(void* arg) {
                 }
             } while (0);
             pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+            // Refresh NM cache for this file so subsequent INFO/VIEW are up-to-date
+            registry_update_one_from_ss(ss_slot, payload.filename);
             continue;
         } else if (header.command == CMD_VIEW_FILES && connections[slot].type == CONN_TYPE_CLIENT) {
-            // Refresh registry to ensure current state
-            registry_refresh_from_ss();
+            // Serve from cache; only refresh if user asked for all files and cache is empty
 
             // Validate payload
             if (header.payload_size != sizeof(MsgViewFilesRequest)) {
@@ -376,7 +418,19 @@ void* handle_connection(void* arg) {
             MsgViewFilesRequest vreq = {0};
             if (!recv_all(socket, &vreq, sizeof(vreq))) { send_error(socket, 400, "Payload read failed"); continue; }
 
-            // Always restrict VIEW to files owned by the requester (ignore show_all flag)
+            if (vreq.show_all) {
+                int fc = 0;
+                pthread_mutex_lock(&file_registry_mutex);
+                fc = file_count;
+                pthread_mutex_unlock(&file_registry_mutex);
+                if (fc == 0) {
+                    registry_refresh_from_ss();
+                }
+            }
+
+            // Use authenticated requester; honor flags:
+            // - show_all=0: list only files requester can access (owner/readers/writers)
+            // - show_all=1: list all files in the system
             char requester[MAX_USERNAME_LEN] = {0};
             strncpy(requester, connections[slot].username, MAX_USERNAME_LEN-1);
 
@@ -385,58 +439,38 @@ void* handle_connection(void* arg) {
             pthread_mutex_lock(&file_registry_mutex);
             for (int i = 0; i < file_count; i++) {
                 const char* fname = file_registry[i].filename;
-                int ss_slot = file_registry[i].ss_slot;
+                const char* owner = file_registry[i].owner;
+                const char* readers = file_registry[i].readers;
+                const char* writers = file_registry[i].writers;
                 char linebuf[2048] = {0};
 
-                // Query SS for INFO to determine owner
-                MsgInfoResponse info = {0};
-                int have_info = 0;
-                pthread_mutex_lock(&connections_mutex);
-                int valid = (ss_slot >= 0 && connections[ss_slot].type == CONN_TYPE_SS && connections[ss_slot].socket >= 0);
-                int ss_sock_local = valid ? connections[ss_slot].socket : -1;
-                pthread_mutex_unlock(&connections_mutex);
-                if (valid) {
-                    pthread_mutex_lock(&connections[ss_slot].ss_io_mutex);
-                    MsgHeader ih = { .command = CMD_INFO, .payload_size = sizeof(MsgInfoRequest) };
-                    MsgInfoRequest ir = {0}; strncpy(ir.filename, fname, MAX_FILENAME_LEN-1);
-                    if (send_all(ss_sock_local, &ih, sizeof(ih)) && send_all(ss_sock_local, &ir, sizeof(ir))) {
-                        MsgHeader rh; if (recv_all(ss_sock_local, &rh, sizeof(rh))) {
-                            if (rh.command == CMD_INFO_RESP && rh.payload_size == sizeof(MsgInfoResponse)) {
-                                if (recv_all(ss_sock_local, &info, sizeof(info))) { have_info = 1; }
-                            } else {
-                                size_t rem = rh.payload_size; char drain[512]; while (rem > 0) { size_t ch = rem>sizeof(drain)?sizeof(drain):rem; if (!recv_all(ss_sock_local, drain, ch)) break; rem -= ch; }
-                            }
-                        }
-                    }
-                    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                int include_file = 1;
+                if (!vreq.show_all) {
+                    include_file = 0;
+                    if (owner[0] && strncmp(owner, requester, MAX_USERNAME_LEN)==0) include_file = 1;
+                    else if (nm_list_contains(readers, requester)) include_file = 1;
+                    else if (nm_list_contains(writers, requester)) include_file = 1;
                 }
+                if (!include_file) continue;
 
-                if (!have_info) continue;
-                // Parse owner from info
-                char owner[MAX_USERNAME_LEN] = {0};
-                const char* p = info.info;
-                while (*p) {
-                    const char* nl = strchr(p, '\n'); size_t len = nl ? (size_t)(nl - p) : strlen(p);
-                    if (len >= 6 && strncmp(p, "owner:", 6) == 0) { sscanf(p+6, "%63s", owner); }
-                    if (!nl) break; p = nl + 1;
-                }
-                if (!(owner[0] && strncmp(owner, requester, MAX_USERNAME_LEN)==0)) continue; // only own files
-
-                if (vreq.long_list && have_info) {
-                    // Include condensed one-line details
-                    char owner2[128]="", size[64]="", words[64]="", chars[64]="", last[128]="", lastmod[128]="";
-                    const char* p2 = info.info;
-                    while (*p2) {
-                        const char* nl = strchr(p2, '\n'); size_t len = nl ? (size_t)(nl - p2) : strlen(p2);
-                        if (len >= 6 && strncmp(p2, "owner:", 6) == 0) { sscanf(p2+6, "%127s", owner2); }
-                        else if (len >= 5 && strncmp(p2, "size:", 5) == 0) { sscanf(p2+5, "%63s", size); }
-                        else if (len >= 6 && strncmp(p2, "words:", 6) == 0) { sscanf(p2+6, "%63s", words); }
-                        else if (len >= 6 && strncmp(p2, "chars:", 6) == 0) { sscanf(p2+6, "%63s", chars); }
-                        else if (len >= 12 && strncmp(p2, "last_access:", 12) == 0) { size_t cplen = len - 12; if (cplen > sizeof(last)-1) cplen = sizeof(last)-1; memcpy(last, p2+12, cplen); last[cplen] = 0; }
-                        else if (len >= 14 && strncmp(p2, "last_modified:", 14) == 0) { size_t cplen = len - 14; if (cplen > sizeof(lastmod)-1) cplen = sizeof(lastmod)-1; memcpy(lastmod, p2+14, cplen); lastmod[cplen] = 0; }
-                        if (!nl) break; p2 = nl + 1;
-                    }
-                    snprintf(linebuf, sizeof(linebuf), "%s\towner:%s\tsize:%s\twords:%s\tchars:%s\tlast_access:%s\tlast_modified:%s\n", fname, owner2, size, words, chars, last[0]?last:"-", lastmod[0]?lastmod:"-");
+                if (vreq.long_list) {
+                    // Build compact one-line from cached fields
+                    char last[128] = "", lastmod[128] = "";
+                    time_t ac = (time_t)file_registry[i].last_access;
+                    time_t mo = (time_t)file_registry[i].last_modified;
+                    struct tm tmv;
+                    if (file_registry[i].last_access && localtime_r(&ac, &tmv)) strftime(last, sizeof(last), "%Y-%m-%d %H:%M:%S", &tmv);
+                    if (file_registry[i].last_modified && localtime_r(&mo, &tmv)) strftime(lastmod, sizeof(lastmod), "%Y-%m-%d %H:%M:%S", &tmv);
+                    snprintf(linebuf, sizeof(linebuf), "%s\towner:%s\tsize:%lld\twords:%lld\tchars:%lld\tlast_access:%s (%lld)\tlast_modified:%s (%lld)\n",
+                             fname,
+                             owner[0]?owner:"",
+                             file_registry[i].size_bytes,
+                             file_registry[i].words_cnt,
+                             file_registry[i].chars_cnt,
+                             last[0]?last:"",
+                             file_registry[i].last_access,
+                             lastmod[0]?lastmod:"",
+                             file_registry[i].last_modified);
                 } else {
                     snprintf(linebuf, sizeof(linebuf), "%s\n", fname);
                 }
@@ -467,8 +501,7 @@ void* handle_connection(void* arg) {
                 continue;
             }
 
-            // Ensure mapping is up-to-date
-            registry_refresh_from_ss();
+            // Try cache-first; refresh only on miss
 
             MsgReadFileResponse resp = {0};
             resp.found = 0;
@@ -490,6 +523,25 @@ void* handle_connection(void* arg) {
             }
             pthread_mutex_unlock(&file_registry_mutex);
 
+            if (!resp.found) {
+                registry_refresh_from_ss();
+                pthread_mutex_lock(&file_registry_mutex);
+                for (int i = 0; i < file_count; i++) {
+                    if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { idx = i; break; }
+                }
+                if (idx >= 0) {
+                    int ss_slot = file_registry[idx].ss_slot;
+                    pthread_mutex_lock(&connections_mutex);
+                    if (ss_slot >= 0 && ss_slot < MAX_CONNECTIONS && connections[ss_slot].type == CONN_TYPE_SS && connections[ss_slot].socket >= 0) {
+                        resp.found = 1;
+                        strncpy(resp.ss_ip, connections[ss_slot].ip_addr, MAX_IP_LEN - 1);
+                        resp.ss_port = connections[ss_slot].client_port;
+                    }
+                    pthread_mutex_unlock(&connections_mutex);
+                }
+                pthread_mutex_unlock(&file_registry_mutex);
+            }
+
             MsgHeader h = {0};
             h.command = CMD_READ_FILE_RESP;
             h.payload_size = sizeof(resp);
@@ -509,9 +561,7 @@ void* handle_connection(void* arg) {
                 send_error(socket, 400, "Payload read failed");
                 continue;
             }
-
-            // Ensure mapping up-to-date and find owning SS
-            registry_refresh_from_ss();
+            // Find owning SS (cache-first; refresh on miss)
             int ss_slot = -1;
             pthread_mutex_lock(&file_registry_mutex);
             for (int i = 0; i < file_count; i++) {
@@ -521,6 +571,14 @@ void* handle_connection(void* arg) {
                 }
             }
             pthread_mutex_unlock(&file_registry_mutex);
+            if (ss_slot < 0) {
+                registry_refresh_from_ss();
+                pthread_mutex_lock(&file_registry_mutex);
+                for (int i = 0; i < file_count; i++) {
+                    if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
+                }
+                pthread_mutex_unlock(&file_registry_mutex);
+            }
             if (ss_slot < 0) {
                 send_error(socket, 404, "File not found");
                 continue;
@@ -564,6 +622,10 @@ void* handle_connection(void* arg) {
                 }
             } while (0);
             pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+            // If ACL change succeeded, refresh cached INFO for this file
+            if (rs.command == CMD_ACK) {
+                registry_update_one_from_ss(ss_slot, req.filename);
+            }
             continue;
         } else if (header.command == CMD_INFO && connections[slot].type == CONN_TYPE_CLIENT) {
             if (header.payload_size != sizeof(MsgInfoRequest)) {
@@ -579,31 +641,81 @@ void* handle_connection(void* arg) {
                 continue;
             }
 
-            // Find owning SS
-            registry_refresh_from_ss();
+            // Authenticated requester
+            char requester[MAX_USERNAME_LEN] = {0};
+            strncpy(requester, connections[slot].username, MAX_USERNAME_LEN-1);
+
+            // Ensure registry has mapping; refresh if empty or filename not yet present
+            int idx = -1;
             int ss_slot = -1;
             pthread_mutex_lock(&file_registry_mutex);
             for (int i = 0; i < file_count; i++) {
-                if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
+                if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { idx = i; ss_slot = file_registry[i].ss_slot; break; }
             }
             pthread_mutex_unlock(&file_registry_mutex);
-            if (ss_slot < 0) { send_error(socket, 404, "File not found"); continue; }
+            if (idx < 0) {
+                // Try global refresh to discover file location
+                registry_refresh_from_ss();
+                pthread_mutex_lock(&file_registry_mutex);
+                for (int i = 0; i < file_count; i++) {
+                    if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { idx = i; ss_slot = file_registry[i].ss_slot; break; }
+                }
+                pthread_mutex_unlock(&file_registry_mutex);
+            }
+            if (idx < 0) { send_error(socket, 404, "File not found"); continue; }
 
-            pthread_mutex_lock(&connections_mutex);
-            int ss_sock_local = connections[ss_slot].socket;
-            pthread_mutex_unlock(&connections_mutex);
+            // If ACL fields or info cache look empty, refresh this one file from its SS
+            int need_single_refresh = 0;
+            pthread_mutex_lock(&file_registry_mutex);
+            if (file_registry[idx].info_str[0] == '\0' || file_registry[idx].owner[0] == '\0') need_single_refresh = 1;
+            pthread_mutex_unlock(&file_registry_mutex);
+            if (need_single_refresh && ss_slot >= 0) {
+                registry_update_one_from_ss(ss_slot, req.filename);
+            }
 
-            pthread_mutex_lock(&connections[ss_slot].ss_io_mutex);
-            MsgHeader rs;
-            do {
-                MsgHeader fwd = {0}; fwd.command = CMD_INFO; fwd.payload_size = sizeof(req);
-                if (!send_all(ss_sock_local, &fwd, sizeof(fwd)) || !send_all(ss_sock_local, &req, sizeof(req))) { pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex); send_error(socket, 502, "Failed to contact Storage Server"); continue; }
-                if (!recv_all(ss_sock_local, &rs, sizeof(rs))) { pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex); send_error(socket, 502, "No response from Storage Server"); continue; }
-                if (!send_all(socket, &rs, sizeof(rs))) { pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex); continue; }
-                size_t rem = rs.payload_size; char buf[512];
-                while (rem > 0) { size_t chunk = rem > sizeof(buf) ? sizeof(buf) : rem; if (!recv_all(ss_sock_local, buf, chunk)) break; if (!send_all(socket, buf, chunk)) break; rem -= chunk; }
-            } while (0);
-            pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+            // Check ACL: owner, reader, or writer only
+            int allowed = 0;
+            char owner[MAX_USERNAME_LEN] = {0};
+            char readers[1024] = {0};
+            char writers[1024] = {0};
+            pthread_mutex_lock(&file_registry_mutex);
+            if (idx >= 0 && idx < file_count) {
+                strncpy(owner, file_registry[idx].owner, sizeof(owner)-1);
+                strncpy(readers, file_registry[idx].readers, sizeof(readers)-1);
+                strncpy(writers, file_registry[idx].writers, sizeof(writers)-1);
+            }
+            pthread_mutex_unlock(&file_registry_mutex);
+            if ((owner[0] && strncmp(owner, requester, MAX_USERNAME_LEN)==0) || nm_list_contains(readers, requester) || nm_list_contains(writers, requester)) {
+                allowed = 1;
+            }
+            if (!allowed) {
+                LOG_NM("INFO '%s' denied for user %s\n", req.filename, requester);
+                send_error(socket, 403, "Forbidden");
+                continue;
+            }
+
+            // Serve INFO directly from NM cache (no per-request SS call)
+            MsgInfoResponse resp = {0};
+            pthread_mutex_lock(&file_registry_mutex);
+            if (idx >= 0 && idx < file_count) {
+                if (file_registry[idx].info_str[0]) {
+                    strncpy(resp.info, file_registry[idx].info_str, sizeof(resp.info)-1);
+                } else {
+                    // Fallback: synthesize minimal info if string missing
+                    snprintf(resp.info, sizeof(resp.info),
+                             "filename: %s\nowner: %s\nsize: %lld\nwords: %lld\nchars: %lld\n",
+                             file_registry[idx].filename,
+                             file_registry[idx].owner,
+                             file_registry[idx].size_bytes,
+                             file_registry[idx].words_cnt,
+                             file_registry[idx].chars_cnt);
+                }
+            }
+            pthread_mutex_unlock(&file_registry_mutex);
+
+            MsgHeader h = { .command = CMD_INFO_RESP, .payload_size = sizeof(resp) };
+            send_all(socket, &h, sizeof(h));
+            send_all(socket, &resp, sizeof(resp));
             continue;
         } else if (header.command == CMD_UNDO && connections[slot].type == CONN_TYPE_CLIENT) {
             if (header.payload_size != sizeof(MsgUndoRequest)) {
@@ -619,14 +731,21 @@ void* handle_connection(void* arg) {
             strncpy(req.requester, connections[slot].username, MAX_USERNAME_LEN-1);
             req.requester[MAX_USERNAME_LEN-1] = '\0';
 
-            // Find owning SS
-            registry_refresh_from_ss();
+            // Find owning SS (cache-first; refresh on miss)
             int ss_slot = -1;
             pthread_mutex_lock(&file_registry_mutex);
             for (int i = 0; i < file_count; i++) {
                 if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
             }
             pthread_mutex_unlock(&file_registry_mutex);
+            if (ss_slot < 0) {
+                registry_refresh_from_ss();
+                pthread_mutex_lock(&file_registry_mutex);
+                for (int i = 0; i < file_count; i++) {
+                    if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
+                }
+                pthread_mutex_unlock(&file_registry_mutex);
+            }
             if (ss_slot < 0) { send_error(socket, 404, "File not found"); continue; }
 
             pthread_mutex_lock(&connections_mutex);
@@ -703,14 +822,21 @@ void* handle_connection(void* arg) {
             strncpy(rq.requester, connections[slot].username, MAX_USERNAME_LEN-1);
             rq.requester[MAX_USERNAME_LEN-1] = '\0';
 
-            // Resolve owning SS
-            registry_refresh_from_ss();
+            // Resolve owning SS (cache-first; refresh on miss)
             int ss_slot = -1;
             pthread_mutex_lock(&file_registry_mutex);
             for (int i = 0; i < file_count; i++) {
                 if (strncmp(file_registry[i].filename, rq.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
             }
             pthread_mutex_unlock(&file_registry_mutex);
+            if (ss_slot < 0) {
+                registry_refresh_from_ss();
+                pthread_mutex_lock(&file_registry_mutex);
+                for (int i = 0; i < file_count; i++) {
+                    if (strncmp(file_registry[i].filename, rq.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
+                }
+                pthread_mutex_unlock(&file_registry_mutex);
+            }
             if (ss_slot < 0) { send_error(socket, 404, "File not found"); continue; }
 
             // Contact SS's client port to fetch file content using header-based READ (SS enforces ACL)
@@ -795,14 +921,21 @@ void* handle_connection(void* arg) {
             strncpy(payload.requester, connections[slot].username, MAX_USERNAME_LEN-1);
             payload.requester[MAX_USERNAME_LEN-1] = '\0';
 
-            // Resolve owning SS for this file
-            registry_refresh_from_ss();
+            // Resolve owning SS for this file (cache-first; refresh on miss)
             int ss_slot = -1;
             pthread_mutex_lock(&file_registry_mutex);
             for (int i = 0; i < file_count; i++) {
                 if (strncmp(file_registry[i].filename, payload.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
             }
             pthread_mutex_unlock(&file_registry_mutex);
+            if (ss_slot < 0) {
+                registry_refresh_from_ss();
+                pthread_mutex_lock(&file_registry_mutex);
+                for (int i = 0; i < file_count; i++) {
+                    if (strncmp(file_registry[i].filename, payload.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
+                }
+                pthread_mutex_unlock(&file_registry_mutex);
+            }
             if (ss_slot < 0) {
                 send_error(socket, 404, "File not found");
                 continue;
@@ -812,8 +945,8 @@ void* handle_connection(void* arg) {
             pthread_mutex_lock(&connections_mutex);
             int ss_sock_local = connections[ss_slot].socket;
             pthread_mutex_unlock(&connections_mutex);
-            printf("[NM] Forwarding DELETE '%s' to SS at %s:%d (Slot %d)\n",
-                   payload.filename, connections[ss_slot].ip_addr, connections[ss_slot].client_port, ss_slot);
+         LOG_NM("Forwarding DELETE '%s' to SS at %s:%d (Slot %d)\n",
+             payload.filename, connections[ss_slot].ip_addr, connections[ss_slot].client_port, ss_slot);
 
             MsgHeader ss_resp;
             pthread_mutex_lock(&connections[ss_slot].ss_io_mutex);
@@ -877,17 +1010,17 @@ void* handle_connection(void* arg) {
     }
     
     // If recv_all fails, the client disconnected
-    printf("[NM] Connection from %s (Socket %d, Slot %d) disconnected.\n", ip, socket, slot);
+    LOG_NM("Connection from %s (Socket %d, Slot %d) disconnected.\n", ip, socket, slot);
     
     // --- CLEANUP ---
     // Free the slot
     pthread_mutex_lock(&connections_mutex);
     if (connections[slot].type == CONN_TYPE_SS) {
-        printf("[NM] Removed Storage Server (Slot %d) from active list.\n", slot);
+    LOG_NM("Removed Storage Server (Slot %d) from active list.\n", slot);
         // Destroy per-SS mutex
         pthread_mutex_destroy(&connections[slot].ss_io_mutex);
     } else if (connections[slot].type == CONN_TYPE_CLIENT) {
-        printf("[NM] Removed Client '%s' (Slot %d) from active list.\n", connections[slot].username, slot);
+    LOG_NM("Removed Client '%s' (Slot %d) from active list.\n", connections[slot].username, slot);
     }
     connections[slot].type = CONN_TYPE_FREE;
     connections[slot].socket = -1;
@@ -907,10 +1040,13 @@ void handle_register_ss(int slot, const MsgRegisterSS* msg) {
     pthread_mutex_init(&connections[slot].ss_io_mutex, NULL);
     pthread_mutex_unlock(&connections_mutex);
 
-    printf("[NM] Storage Server registered from %s. Listening for clients on port %d. (Slot: %d)\n",
-           connections[slot].ip_addr, msg->client_listen_port, slot);
+    LOG_NM("Storage Server registered from %s. Listening for clients on port %d. (Slot: %d)\n",
+        connections[slot].ip_addr, msg->client_listen_port, slot);
 
     send_ack(connections[slot].socket);
+
+    // Populate/refresh registry mapping when a new SS registers (infrequent, acceptable cost)
+    registry_refresh_from_ss();
 }
 
 /**
@@ -924,8 +1060,8 @@ void handle_register_client(int slot, const MsgRegisterClient* msg) {
     connections[slot].username[MAX_USERNAME_LEN - 1] = '\0';
     pthread_mutex_unlock(&connections_mutex);
 
-    printf("[NM] Client '%s' registered from %s. (Slot: %d)\n",
-           connections[slot].username, connections[slot].ip_addr, slot);
+    LOG_NM("Client '%s' registered from %s. (Slot: %d)\n",
+        connections[slot].username, connections[slot].ip_addr, slot);
            
     send_ack(connections[slot].socket);
 }
@@ -939,7 +1075,7 @@ void send_ack(int socket) {
     ack_header.payload_size = 0;
     
     if (!send_all(socket, &ack_header, sizeof(MsgHeader))) {
-        fprintf(stderr, "[NM] Failed to send ACK to socket %d\n", socket);
+        LOGE_NM("Failed to send ACK to socket %d\n", socket);
     }
 }
 
@@ -1065,7 +1201,7 @@ static void registry_refresh_from_ss(void) {
     }
     pthread_mutex_unlock(&connections_mutex);
 
-    // Replace registry with the new mapping
+    // Replace registry with the new mapping and populate cached INFO for each file
     pthread_mutex_lock(&file_registry_mutex);
     file_count = 0;
     for (int i = 0; i < ncount && i < MAX_FILES; i++) {
@@ -1073,10 +1209,107 @@ static void registry_refresh_from_ss(void) {
         file_registry[file_count].filename[MAX_FILENAME_LEN - 1] = '\0';
         file_registry[file_count].owner[0] = '\0';
         file_registry[file_count].ss_slot = slots[i];
+        file_registry[file_count].created = 0;
+        file_registry[file_count].updated = 0;
+        file_registry[file_count].size_bytes = 0;
+        file_registry[file_count].words_cnt = 0;
+        file_registry[file_count].chars_cnt = 0;
+        file_registry[file_count].last_access = 0;
+        file_registry[file_count].last_modified = 0;
+        file_registry[file_count].readers[0] = '\0';
+        file_registry[file_count].writers[0] = '\0';
+        file_registry[file_count].info_str[0] = '\0';
         file_count++;
     }
     pthread_mutex_unlock(&file_registry_mutex);
 
+    // Populate cached INFO for each file from respective SS
+    for (int i = 0; i < ncount; i++) {
+        registry_update_one_from_ss(slots[i], names[i]);
+    }
+
     free(names);
     free(slots);
+}
+
+// Helper: refresh cached INFO for a single file owned by ss_slot
+static void registry_update_one_from_ss(int ss_slot, const char* filename) {
+    if (ss_slot < 0 || !filename || !*filename) return;
+
+    // Validate SS connection
+    pthread_mutex_lock(&connections_mutex);
+    int valid = (ss_slot < MAX_CONNECTIONS && connections[ss_slot].type == CONN_TYPE_SS && connections[ss_slot].socket >= 0);
+    int ss_sock = valid ? connections[ss_slot].socket : -1;
+    pthread_mutex_unlock(&connections_mutex);
+    if (!valid) return;
+
+    MsgInfoResponse info = {0};
+    int got = 0;
+    pthread_mutex_lock(&connections[ss_slot].ss_io_mutex);
+    do {
+        MsgHeader ih = { .command = CMD_INFO, .payload_size = sizeof(MsgInfoRequest) };
+        MsgInfoRequest ir = {0};
+        strncpy(ir.filename, filename, MAX_FILENAME_LEN-1);
+        if (!send_all(ss_sock, &ih, sizeof(ih)) || !send_all(ss_sock, &ir, sizeof(ir))) break;
+        MsgHeader rh;
+        if (!recv_all(ss_sock, &rh, sizeof(rh))) break;
+        if (rh.command != CMD_INFO_RESP || rh.payload_size != sizeof(MsgInfoResponse)) {
+            // drain
+            size_t rem = rh.payload_size; char drain[512];
+            while (rem > 0) { size_t ch = rem>sizeof(drain)?sizeof(drain):rem; if (!recv_all(ss_sock, drain, ch)) break; rem -= ch; }
+            break;
+        }
+        if (!recv_all(ss_sock, &info, sizeof(info))) break;
+        got = 1;
+    } while (0);
+    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+
+    if (!got) return;
+
+    // Parse INFO into registry cache
+    pthread_mutex_lock(&file_registry_mutex);
+    int idx = -1;
+    for (int i = 0; i < file_count; i++) {
+        if (strncmp(file_registry[i].filename, filename, MAX_FILENAME_LEN) == 0) { idx = i; break; }
+    }
+    if (idx >= 0) {
+        // Preserve the full info string
+        strncpy(file_registry[idx].info_str, info.info, sizeof(file_registry[idx].info_str)-1);
+        file_registry[idx].info_str[sizeof(file_registry[idx].info_str)-1] = '\0';
+
+        // Extract fields
+        const char* p = info.info;
+        char owner[MAX_USERNAME_LEN] = {0};
+        long long created=0, updated=0, size=0, words=0, chars=0, last_access=0, last_mod=0;
+        char readers[1024] = {0}, writers[1024] = {0};
+        while (*p) {
+            const char* nl = strchr(p, '\n'); size_t len = nl ? (size_t)(nl - p) : strlen(p);
+            if (len >= 6 && strncmp(p, "owner:", 6) == 0) { sscanf(p+6, "%63s", owner); }
+            else if (len >= 8 && strncmp(p, "created:", 8) == 0) { const char* par = strchr(p, '('); if (par) created = atoll(par+1); }
+            else if (len >= 8 && strncmp(p, "updated:", 8) == 0) { const char* par = strchr(p, '('); if (par) updated = atoll(par+1); }
+            else if (len >= 5 && strncmp(p, "size:", 5) == 0) { sscanf(p+5, "%lld", &size); }
+            else if (len >= 6 && strncmp(p, "words:", 6) == 0) { sscanf(p+6, "%lld", &words); }
+            else if (len >= 6 && strncmp(p, "chars:", 6) == 0) { sscanf(p+6, "%lld", &chars); }
+            else if (len >= 12 && strncmp(p, "last_access:", 12) == 0) { const char* par = strchr(p, '('); if (par) last_access = atoll(par+1); }
+            else if (len >= 14 && strncmp(p, "last_modified:", 14) == 0) { const char* par = strchr(p, '('); if (par) last_mod = atoll(par+1); }
+            else if (len >= 8 && strncmp(p, "readers:", 8) == 0) { size_t cp = len-8; if (cp > sizeof(readers)-1) cp = sizeof(readers)-1; memcpy(readers, p+8, cp); readers[cp] = '\0'; }
+            else if (len >= 8 && strncmp(p, "writers:", 8) == 0) { size_t cp = len-8; if (cp > sizeof(writers)-1) cp = sizeof(writers)-1; memcpy(writers, p+8, cp); writers[cp] = '\0'; }
+            if (!nl) break; p = nl + 1;
+        }
+        strncpy(file_registry[idx].owner, owner, sizeof(file_registry[idx].owner)-1);
+        file_registry[idx].created = created;
+        file_registry[idx].updated = updated;
+        file_registry[idx].size_bytes = size;
+        file_registry[idx].words_cnt = words;
+        file_registry[idx].chars_cnt = chars;
+        file_registry[idx].last_access = last_access;
+        file_registry[idx].last_modified = last_mod;
+        // normalize ACL strings (trim)
+        // Remove trailing newlines/spaces
+        size_t rlen = strlen(readers); while (rlen>0 && (readers[rlen-1]=='\r'||readers[rlen-1]=='\n'||readers[rlen-1]==' '||readers[rlen-1]=='\t')) readers[--rlen]=0;
+        size_t wlen = strlen(writers); while (wlen>0 && (writers[wlen-1]=='\r'||writers[wlen-1]=='\n'||writers[wlen-1]==' '||writers[wlen-1]=='\t')) writers[--wlen]=0;
+        strncpy(file_registry[idx].readers, readers, sizeof(file_registry[idx].readers)-1);
+        strncpy(file_registry[idx].writers, writers, sizeof(file_registry[idx].writers)-1);
+    }
+    pthread_mutex_unlock(&file_registry_mutex);
 }

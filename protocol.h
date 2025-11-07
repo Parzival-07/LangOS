@@ -4,8 +4,11 @@
 #include <string.h> // for memset, strcpy, etc.
 #include <unistd.h> // for read, write
 #include <sys/socket.h> // for socket operations
+#include <signal.h>     // for SIGPIPE
 #include <stdbool.h> // for bool, true, false
 #include <stdio.h> // for perror
+#include <stdarg.h>
+#include <time.h>
 
 // --- CONFIGURATION ---
 
@@ -60,6 +63,9 @@ typedef enum {
 
     // Undo last change (Client -> NM -> SS)
     CMD_UNDO = 370,
+
+    // Stream file content (Client -> SS via NM routing)
+    CMD_STREAM = 375,
 
     // User listing
     CMD_LIST_USERS = 380,
@@ -203,6 +209,12 @@ typedef struct {
     char users[16384]; // newline-separated usernames
 } MsgUsersListResponse;
 
+// Data for CMD_STREAM (Client -> SS)
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+    char requester[MAX_USERNAME_LEN];
+} MsgStreamRequest;
+
 // Data for CMD_EXEC (Client -> NM)
 typedef struct {
     char filename[MAX_FILENAME_LEN];
@@ -225,7 +237,12 @@ static inline bool send_all(int socket_fd, const void* buffer, size_t size) {
     const char* ptr = (const char*)buffer;
     size_t total_sent = 0;
     while (total_sent < size) {
+        // Avoid process termination on EPIPE by disabling SIGPIPE for this send
+        #ifdef MSG_NOSIGNAL
+        ssize_t sent = send(socket_fd, ptr + total_sent, size - total_sent, MSG_NOSIGNAL);
+        #else
         ssize_t sent = send(socket_fd, ptr + total_sent, size - total_sent, 0);
+        #endif
         if (sent <= 0) {
             // 0 means connection closed, -1 is an error
             perror("send_all");
@@ -261,6 +278,37 @@ static inline bool recv_all(int socket_fd, void* buffer, size_t size) {
     }
     return true;
 }
+
+// --- LOGGING HELPERS (timestamped) ---
+// Format: [YYYY-MM-DD HH:MM:SS] [COMP] message...
+static inline void _get_ts(char* buf, size_t n) {
+    if (!buf || n == 0) return;
+    time_t now = time(NULL);
+    struct tm tmv;
+#if defined(_WIN32)
+    localtime_s(&tmv, &now);
+#else
+    localtime_r(&now, &tmv);
+#endif
+    strftime(buf, n, "%Y-%m-%d %H:%M:%S", &tmv);
+}
+
+#define LOG_INFO_C(COMP, fmt, ...) do { \
+    char _ts[24]; _get_ts(_ts, sizeof(_ts)); \
+    printf("[%s] [%s] " fmt, _ts, COMP, ##__VA_ARGS__); \
+} while(0)
+
+#define LOG_ERR_C(COMP, fmt, ...) do { \
+    char _ts[24]; _get_ts(_ts, sizeof(_ts)); \
+    fprintf(stderr, "[%s] [%s] " fmt, _ts, COMP, ##__VA_ARGS__); \
+} while(0)
+
+#define LOG_NM(fmt, ...)      LOG_INFO_C("NM", fmt, ##__VA_ARGS__)
+#define LOGE_NM(fmt, ...)     LOG_ERR_C("NM", fmt, ##__VA_ARGS__)
+#define LOG_SS(fmt, ...)      LOG_INFO_C("SS", fmt, ##__VA_ARGS__)
+#define LOGE_SS(fmt, ...)     LOG_ERR_C("SS", fmt, ##__VA_ARGS__)
+#define LOG_CLIENT(fmt, ...)  LOG_INFO_C("Client", fmt, ##__VA_ARGS__)
+#define LOGE_CLIENT(fmt, ...) LOG_ERR_C("Client", fmt, ##__VA_ARGS__)
 
 #endif // PROTOCOL_H
 
