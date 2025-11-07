@@ -72,6 +72,90 @@ static FileRecord file_registry[MAX_FILES];
 static int file_count = 0;
 static pthread_mutex_t file_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// --- FAST LOOKUP INDEX (O(1) average) ---
+// Hash map from filename -> index in file_registry[] using open hashing (separate chaining).
+#define FILE_INDEX_BUCKETS 4096
+typedef struct FileIndexNode {
+    char key[MAX_FILENAME_LEN];
+    int idx; // index into file_registry
+    struct FileIndexNode* next;
+} FileIndexNode;
+
+static FileIndexNode* file_index[FILE_INDEX_BUCKETS];
+static pthread_mutex_t file_index_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static unsigned long fnv1a_hash(const char* s) {
+    unsigned long h = 1469598103934665603ULL; // 64-bit FNV offset basis
+    while (*s) {
+        h ^= (unsigned char)(*s++);
+        h *= 1099511628211ULL; // 64-bit FNV prime
+    }
+    return (unsigned long)h;
+}
+
+static inline int bucket_for(const char* key) {
+    return (int)(fnv1a_hash(key) & (FILE_INDEX_BUCKETS - 1)); // buckets is power of two
+}
+
+static void file_index_clear_unlocked(void) {
+    for (int i = 0; i < FILE_INDEX_BUCKETS; i++) {
+        FileIndexNode* n = file_index[i];
+        while (n) { FileIndexNode* nx = n->next; free(n); n = nx; }
+        file_index[i] = NULL;
+    }
+}
+
+static void file_index_build(void) {
+    pthread_mutex_lock(&file_index_mutex);
+    file_index_clear_unlocked();
+    pthread_mutex_lock(&file_registry_mutex);
+    for (int i = 0; i < file_count; i++) {
+        const char* k = file_registry[i].filename;
+        if (!k[0]) continue;
+        int b = bucket_for(k);
+        FileIndexNode* n = (FileIndexNode*)calloc(1, sizeof(FileIndexNode));
+        if (!n) continue;
+        strncpy(n->key, k, sizeof(n->key)-1);
+        n->idx = i;
+        n->next = file_index[b];
+        file_index[b] = n;
+    }
+    pthread_mutex_unlock(&file_registry_mutex);
+    pthread_mutex_unlock(&file_index_mutex);
+}
+
+static void file_index_insert(const char* filename, int idx) {
+    if (!filename || !*filename || idx < 0) return;
+    pthread_mutex_lock(&file_index_mutex);
+    int b = bucket_for(filename);
+    for (FileIndexNode* n = file_index[b]; n; n = n->next) {
+        if (strncmp(n->key, filename, MAX_FILENAME_LEN) == 0) { n->idx = idx; pthread_mutex_unlock(&file_index_mutex); return; }
+    }
+    FileIndexNode* n = (FileIndexNode*)calloc(1, sizeof(FileIndexNode));
+    if (n) {
+        strncpy(n->key, filename, sizeof(n->key)-1);
+        n->idx = idx;
+        n->next = file_index[b];
+        file_index[b] = n;
+    }
+    pthread_mutex_unlock(&file_index_mutex);
+}
+
+static int file_index_find(const char* filename) {
+    if (!filename || !*filename) return -1;
+    int b = bucket_for(filename);
+    pthread_mutex_lock(&file_index_mutex);
+    for (FileIndexNode* n = file_index[b]; n; n = n->next) {
+        if (strncmp(n->key, filename, MAX_FILENAME_LEN) == 0) {
+            int idx = n->idx;
+            pthread_mutex_unlock(&file_index_mutex);
+            return idx;
+        }
+    }
+    pthread_mutex_unlock(&file_index_mutex);
+    return -1;
+}
+
 // --- Small helpers ---
 // Check if a space-separated list contains a username (exact token match)
 static int nm_list_contains(const char* list, const char* user) {
@@ -506,11 +590,8 @@ void* handle_connection(void* arg) {
             MsgReadFileResponse resp = {0};
             resp.found = 0;
 
+            int idx = file_index_find(req.filename);
             pthread_mutex_lock(&file_registry_mutex);
-            int idx = -1;
-            for (int i = 0; i < file_count; i++) {
-                if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { idx = i; break; }
-            }
             if (idx >= 0) {
                 int ss_slot = file_registry[idx].ss_slot;
                 pthread_mutex_lock(&connections_mutex);
@@ -525,10 +606,8 @@ void* handle_connection(void* arg) {
 
             if (!resp.found) {
                 registry_refresh_from_ss();
+                idx = file_index_find(req.filename);
                 pthread_mutex_lock(&file_registry_mutex);
-                for (int i = 0; i < file_count; i++) {
-                    if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { idx = i; break; }
-                }
                 if (idx >= 0) {
                     int ss_slot = file_registry[idx].ss_slot;
                     pthread_mutex_lock(&connections_mutex);
@@ -563,20 +642,15 @@ void* handle_connection(void* arg) {
             }
             // Find owning SS (cache-first; refresh on miss)
             int ss_slot = -1;
+            int idx_acc = file_index_find(req.filename);
             pthread_mutex_lock(&file_registry_mutex);
-            for (int i = 0; i < file_count; i++) {
-                if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) {
-                    ss_slot = file_registry[i].ss_slot;
-                    break;
-                }
-            }
+            if (idx_acc >= 0) ss_slot = file_registry[idx_acc].ss_slot;
             pthread_mutex_unlock(&file_registry_mutex);
             if (ss_slot < 0) {
                 registry_refresh_from_ss();
+                idx_acc = file_index_find(req.filename);
                 pthread_mutex_lock(&file_registry_mutex);
-                for (int i = 0; i < file_count; i++) {
-                    if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
-                }
+                if (idx_acc >= 0) ss_slot = file_registry[idx_acc].ss_slot;
                 pthread_mutex_unlock(&file_registry_mutex);
             }
             if (ss_slot < 0) {
@@ -646,20 +720,17 @@ void* handle_connection(void* arg) {
             strncpy(requester, connections[slot].username, MAX_USERNAME_LEN-1);
 
             // Ensure registry has mapping; refresh if empty or filename not yet present
-            int idx = -1;
+            int idx = file_index_find(req.filename);
             int ss_slot = -1;
             pthread_mutex_lock(&file_registry_mutex);
-            for (int i = 0; i < file_count; i++) {
-                if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { idx = i; ss_slot = file_registry[i].ss_slot; break; }
-            }
+            if (idx >= 0) ss_slot = file_registry[idx].ss_slot;
             pthread_mutex_unlock(&file_registry_mutex);
             if (idx < 0) {
                 // Try global refresh to discover file location
                 registry_refresh_from_ss();
+                idx = file_index_find(req.filename);
                 pthread_mutex_lock(&file_registry_mutex);
-                for (int i = 0; i < file_count; i++) {
-                    if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { idx = i; ss_slot = file_registry[i].ss_slot; break; }
-                }
+                if (idx >= 0) ss_slot = file_registry[idx].ss_slot;
                 pthread_mutex_unlock(&file_registry_mutex);
             }
             if (idx < 0) { send_error(socket, 404, "File not found"); continue; }
@@ -733,17 +804,15 @@ void* handle_connection(void* arg) {
 
             // Find owning SS (cache-first; refresh on miss)
             int ss_slot = -1;
+            int idx_undo = file_index_find(req.filename);
             pthread_mutex_lock(&file_registry_mutex);
-            for (int i = 0; i < file_count; i++) {
-                if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
-            }
+            if (idx_undo >= 0) ss_slot = file_registry[idx_undo].ss_slot;
             pthread_mutex_unlock(&file_registry_mutex);
             if (ss_slot < 0) {
                 registry_refresh_from_ss();
+                idx_undo = file_index_find(req.filename);
                 pthread_mutex_lock(&file_registry_mutex);
-                for (int i = 0; i < file_count; i++) {
-                    if (strncmp(file_registry[i].filename, req.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
-                }
+                if (idx_undo >= 0) ss_slot = file_registry[idx_undo].ss_slot;
                 pthread_mutex_unlock(&file_registry_mutex);
             }
             if (ss_slot < 0) { send_error(socket, 404, "File not found"); continue; }
@@ -824,17 +893,15 @@ void* handle_connection(void* arg) {
 
             // Resolve owning SS (cache-first; refresh on miss)
             int ss_slot = -1;
+            int idx_exec = file_index_find(rq.filename);
             pthread_mutex_lock(&file_registry_mutex);
-            for (int i = 0; i < file_count; i++) {
-                if (strncmp(file_registry[i].filename, rq.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
-            }
+            if (idx_exec >= 0) ss_slot = file_registry[idx_exec].ss_slot;
             pthread_mutex_unlock(&file_registry_mutex);
             if (ss_slot < 0) {
                 registry_refresh_from_ss();
+                idx_exec = file_index_find(rq.filename);
                 pthread_mutex_lock(&file_registry_mutex);
-                for (int i = 0; i < file_count; i++) {
-                    if (strncmp(file_registry[i].filename, rq.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
-                }
+                if (idx_exec >= 0) ss_slot = file_registry[idx_exec].ss_slot;
                 pthread_mutex_unlock(&file_registry_mutex);
             }
             if (ss_slot < 0) { send_error(socket, 404, "File not found"); continue; }
@@ -923,17 +990,15 @@ void* handle_connection(void* arg) {
 
             // Resolve owning SS for this file (cache-first; refresh on miss)
             int ss_slot = -1;
+            int idx_del = file_index_find(payload.filename);
             pthread_mutex_lock(&file_registry_mutex);
-            for (int i = 0; i < file_count; i++) {
-                if (strncmp(file_registry[i].filename, payload.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
-            }
+            if (idx_del >= 0) ss_slot = file_registry[idx_del].ss_slot;
             pthread_mutex_unlock(&file_registry_mutex);
             if (ss_slot < 0) {
                 registry_refresh_from_ss();
+                idx_del = file_index_find(payload.filename);
                 pthread_mutex_lock(&file_registry_mutex);
-                for (int i = 0; i < file_count; i++) {
-                    if (strncmp(file_registry[i].filename, payload.filename, MAX_FILENAME_LEN) == 0) { ss_slot = file_registry[i].ss_slot; break; }
-                }
+                if (idx_del >= 0) ss_slot = file_registry[idx_del].ss_slot;
                 pthread_mutex_unlock(&file_registry_mutex);
             }
             if (ss_slot < 0) {
@@ -1002,6 +1067,8 @@ void* handle_connection(void* arg) {
                     }
                 }
                 pthread_mutex_unlock(&file_registry_mutex);
+                // Rebuild fast index after mutation
+                file_index_build();
             }
             continue;
         }
@@ -1106,6 +1173,8 @@ static void send_error(int socket, int code, const char* msg) {
 
 static void registry_add_file_if_absent(const char* filename, const char* owner, int ss_slot) {
     if (!filename || !*filename) return;
+    int do_insert_index = 0;
+    int new_idx = -1;
     pthread_mutex_lock(&file_registry_mutex);
     for (int i = 0; i < file_count; i++) {
         if (strncmp(file_registry[i].filename, filename, MAX_FILENAME_LEN) == 0) {
@@ -1117,12 +1186,18 @@ static void registry_add_file_if_absent(const char* filename, const char* owner,
         }
     }
     if (file_count < MAX_FILES) {
-        strncpy(file_registry[file_count].filename, filename, MAX_FILENAME_LEN - 1);
-        if (owner) strncpy(file_registry[file_count].owner, owner, MAX_USERNAME_LEN - 1);
-        file_registry[file_count].ss_slot = ss_slot;
+        new_idx = file_count;
+        strncpy(file_registry[new_idx].filename, filename, MAX_FILENAME_LEN - 1);
+        if (owner) strncpy(file_registry[new_idx].owner, owner, MAX_USERNAME_LEN - 1);
+        file_registry[new_idx].ss_slot = ss_slot;
         file_count++;
+        do_insert_index = 1;
     }
     pthread_mutex_unlock(&file_registry_mutex);
+    // Update fast index outside of file_registry_mutex to avoid lock order inversion
+    if (do_insert_index) {
+        file_index_insert(filename, new_idx);
+    }
 }
 
 // Query all connected SS for their file lists and rebuild the registry (union)
@@ -1222,6 +1297,9 @@ static void registry_refresh_from_ss(void) {
         file_count++;
     }
     pthread_mutex_unlock(&file_registry_mutex);
+
+    // Rebuild the fast index from the refreshed registry
+    file_index_build();
 
     // Populate cached INFO for each file from respective SS
     for (int i = 0; i < ncount; i++) {
