@@ -266,11 +266,35 @@ static int ss_delete_file_do(const char* filename) {
     snprintf(txt, sizeof(txt),  STORAGE_ROOT "/%s",       filename);
     snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", filename);
 
-    // Attempt to remove both files; both must succeed per spec
-    if (remove(txt) != 0) {
-        return -1;
+    // Determine owner from meta to place into trash subdir
+    FILE* mf = fopen(meta, "r");
+    if (!mf) return -1;
+    char owner[MAX_USERNAME_LEN] = {0}; char line[1024];
+    while (fgets(line, sizeof(line), mf)) {
+        if (strncmp(line, "owner:", 6) == 0) { sscanf(line+6, "%63s", owner); break; }
     }
-    if (remove(meta) != 0) {
+    fclose(mf);
+    if (!owner[0]) return -1;
+
+    // Prepare trash directories: ss_data/.trash/<owner>
+    char trash_root[512]; snprintf(trash_root, sizeof(trash_root), STORAGE_ROOT "/.trash");
+    if (ensure_dir(trash_root) != 0) return -1;
+    char trash_owner[512]; snprintf(trash_owner, sizeof(trash_owner), STORAGE_ROOT "/.trash/%s", owner);
+    if (ensure_dir(trash_owner) != 0) return -1;
+
+    // Build destination paths
+    char dst_txt[1024], dst_meta[1024];
+    snprintf(dst_txt, sizeof(dst_txt),   "%s/%s", trash_owner, filename);
+    snprintf(dst_meta, sizeof(dst_meta), "%s/%s.meta", trash_owner, filename);
+
+    // If destination files already exist in trash, remove them first
+    remove(dst_txt); remove(dst_meta);
+
+    // Move content and meta into trash (atomic rename on same filesystem)
+    if (rename(txt, dst_txt) != 0) return -1;
+    if (rename(meta, dst_meta) != 0) {
+        // Attempt to rollback content move if meta move fails
+        rename(dst_txt, txt);
         return -1;
     }
     return 0;
@@ -690,9 +714,50 @@ static int undo_restore_last(const char* filename, char* errbuf, size_t errlen) 
     fclose(src); fclose(dst);
     if (rename(tmp, content) != 0) { remove(tmp); snprintf(errbuf, errlen, "Replace failed"); return -1; }
     remove(bakpath);
-    // touch metadata updated
+    // Update metadata 'updated' while preserving 'accessed' and ACL lines
     char meta[600]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", filename);
-    FILE* mf = fopen(meta, "a"); if (mf) { time_t now = time(NULL); fprintf(mf, "updated:%lld\n", (long long)now); fclose(mf); }
+    // Read existing meta to preserve fields
+    char owner[MAX_USERNAME_LEN]={0}; long long created=0; long long accessed_keep=0; char readers[1024]={0}; char writers[1024]={0};
+    FILE* mfr = fopen(meta, "r");
+    if (mfr) {
+        char linebuf[2048];
+        while (fgets(linebuf, sizeof(linebuf), mfr)) {
+            if (strncmp(linebuf, "owner:",6)==0) { sscanf(linebuf+6, "%63s", owner); }
+            else if (strncmp(linebuf, "created:",8)==0) { sscanf(linebuf+8, "%lld", &created); }
+            else if (strncmp(linebuf, "accessed:",9)==0) { long long t=0; if (sscanf(linebuf+9, "%lld", &t)==1 && t>accessed_keep) accessed_keep=t; }
+            else if (strncmp(linebuf, "readers:",8)==0) { strncpy(readers, linebuf+8, sizeof(readers)-1); }
+            else if (strncmp(linebuf, "writers:",8)==0) { strncpy(writers, linebuf+8, sizeof(writers)-1); }
+        }
+        fclose(mfr);
+        trim_both(readers); trim_both(writers);
+    }
+    FILE* mfw = fopen(meta, "w");
+    if (mfw) {
+        time_t now = time(NULL);
+        fprintf(mfw, "owner:%s\n", owner);
+        fprintf(mfw, "created:%lld\n", created);
+        fprintf(mfw, "updated:%lld\n", (long long)now);
+        if (accessed_keep>0) fprintf(mfw, "accessed:%lld\n", accessed_keep);
+        fprintf(mfw, "readers:%s%s\n", (readers[0]?" ":""), readers);
+        fprintf(mfw, "writers:%s%s\n", (writers[0]?" ":""), writers);
+        fclose(mfw);
+    }
+    return 0;
+}
+
+// --- ACCESS REQUESTS SUPPORT ---
+// Requests stored under STORAGE_ROOT/.requests/<filename>/<requester>.req with content "READ" or "WRITE"
+static int ensure_requests_root(void) {
+    char root[512]; snprintf(root, sizeof(root), STORAGE_ROOT "/.requests");
+    if (ensure_dir(STORAGE_ROOT) != 0) return -1;
+    return ensure_dir(root);
+}
+
+static int ensure_requests_dir_for(const char* filename, char* out_dir, size_t out_sz) {
+    if (!is_valid_filename(filename)) return -1;
+    if (ensure_requests_root() != 0) return -1;
+    snprintf(out_dir, out_sz, STORAGE_ROOT "/.requests/%s", filename);
+    if (ensure_dir(out_dir) != 0) return -1;
     return 0;
 }
 
@@ -788,6 +853,12 @@ static void* handle_one_client(void* arg) {
                         remaining -= nr;
                     }
                     fclose(f);
+                    // Record access time in metadata (portable alternative to atime)
+                    {
+                        char meta_path[512]; snprintf(meta_path, sizeof(meta_path), STORAGE_ROOT "/%s.meta", req.filename);
+                        FILE* mf_acc = fopen(meta_path, "a");
+                        if (mf_acc) { time_t now = time(NULL); fprintf(mf_acc, "accessed:%lld\n", (long long)now); fclose(mf_acc); }
+                    }
                     continue;
                 }
                 case CMD_WRITE_FILE: {
@@ -992,6 +1063,12 @@ static void* handle_one_client(void* arg) {
                     fclose(f);
                     // Signal end with a sentinel line the client can detect
                     (void)send_all(client_socket, "STOP\n", 5);
+                    // Record access time in metadata (portable alternative to atime)
+                    {
+                        char meta_path[512]; snprintf(meta_path, sizeof(meta_path), STORAGE_ROOT "/%s.meta", rq.filename);
+                        FILE* mf_acc = fopen(meta_path, "a");
+                        if (mf_acc) { time_t now = time(NULL); fprintf(mf_acc, "accessed:%lld\n", (long long)now); fclose(mf_acc); }
+                    }
                     // Close the connection immediately for cleanliness
                     close(client_socket);
                     // Release any locks held by this client
@@ -1098,6 +1175,114 @@ void* listen_to_nm(void* arg) {
         
         // Handle commands from NM
     switch (header.command) {
+            case CMD_CLEAR_FILE: {
+                if (header.payload_size != sizeof(MsgClearFile)) { nm_send_error(400, "Bad payload size"); break; }
+                MsgClearFile msg; if (!recv_all(nm_socket, &msg, sizeof(msg))) { nm_send_error(400, "Payload read failed"); break; }
+                if (!is_valid_filename(msg.filename)) { nm_send_error(400, "Invalid filename"); break; }
+                // Disallow while any sentence locks are active for this file
+                if (sentence_lock_any_for_file(msg.filename)) { nm_send_error(423, "File has active write lock"); break; }
+                // ACL: owner or writer may clear
+                char meta[512]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", msg.filename);
+                FILE* mf = fopen(meta, "r"); if (!mf) { nm_send_error(404, "File not found"); break; }
+                char owner[MAX_USERNAME_LEN] = {0}; char writers[1024] = {0}; char line[2048];
+                while (fgets(line, sizeof(line), mf)) {
+                    if (strncmp(line, "owner:", 6) == 0) { sscanf(line+6, "%63s", owner); }
+                    else if (strncmp(line, "writers:", 8) == 0) { strncpy(writers, line+8, sizeof(writers)-1); }
+                }
+                fclose(mf);
+                trim_both(writers);
+                if (!((owner[0] && msg.requester[0] && strncmp(owner, msg.requester, MAX_USERNAME_LEN)==0) || list_contains(writers, msg.requester))) {
+                    nm_send_error(403, "Write access denied");
+                    break;
+                }
+                // Snapshot current content for UNDO, then truncate file to zero
+                char path[512]; snprintf(path, sizeof(path), STORAGE_ROOT "/%s", msg.filename);
+                struct stat st; if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) { nm_send_error(404, "File not found"); break; }
+                (void)undo_snapshot(msg.filename, path);
+                FILE* f = fopen(path, "wb"); if (!f) { nm_send_error(500, "Open failed"); break; }
+                fclose(f);
+                // Update metadata 'updated' timestamp
+                mf = fopen(meta, "a"); if (mf) { fprintf(mf, "updated:%lld\n", (long long)time(NULL)); fclose(mf); }
+                MsgHeader ack = (MsgHeader){ .command = CMD_ACK, .payload_size = 0 };
+                send_all(nm_socket, &ack, sizeof(ack));
+                break;
+            }
+            case CMD_TRASH_LIST: {
+                if (header.payload_size != sizeof(MsgTrashList)) { nm_send_error(400, "Bad payload size"); break; }
+                MsgTrashList msg; if (!recv_all(nm_socket, &msg, sizeof(msg))) { nm_send_error(400, "Payload read failed"); break; }
+                // List files in STORAGE_ROOT/.trash/<owner>
+                char trash_dir[512]; snprintf(trash_dir, sizeof(trash_dir), STORAGE_ROOT "/.trash/%s", msg.owner);
+                MsgTrashListResp resp; memset(&resp, 0, sizeof(resp));
+                DIR* d = opendir(trash_dir);
+                size_t pos = 0, cap = sizeof(resp.files);
+                if (d) {
+                    struct dirent* de; while ((de = readdir(d)) != NULL) {
+                        const char* name = de->d_name; if (strcmp(name, ".")==0 || strcmp(name, "..")==0) continue; size_t nlen = strlen(name);
+                        if (nlen > 5 && strcmp(name + nlen - 5, ".meta") == 0) continue; // skip .meta entries
+                        int n = snprintf(resp.files + pos, (pos < cap ? cap - pos : 0), "%s\n", name);
+                        if (n <= 0) break; if ((size_t)n >= (cap - pos)) { pos = cap - 1; break; } pos += (size_t)n;
+                    }
+                    closedir(d);
+                }
+                MsgHeader h = { .command = CMD_TRASH_LIST_RESP, .payload_size = sizeof(resp) };
+                send_all(nm_socket, &h, sizeof(h));
+                send_all(nm_socket, &resp, sizeof(resp));
+                break;
+            }
+            case CMD_TRASH_RECOVER: {
+                if (header.payload_size != sizeof(MsgTrashRecover)) { nm_send_error(400, "Bad payload size"); break; }
+                MsgTrashRecover msg; if (!recv_all(nm_socket, &msg, sizeof(msg))) { nm_send_error(400, "Payload read failed"); break; }
+                // Owner-only: verify meta in trash if needed; but enforce via owner path isolation
+                char src_txt[1024], src_meta[1024];
+                snprintf(src_txt, sizeof(src_txt),  STORAGE_ROOT "/.trash/%s/%s", msg.owner, msg.filename);
+                snprintf(src_meta, sizeof(src_meta), STORAGE_ROOT "/.trash/%s/%s.meta", msg.owner, msg.filename);
+                // Destination (use newname if provided)
+                const char* outname = (msg.newname[0] ? msg.newname : msg.filename);
+                if (!is_valid_filename(outname)) { nm_send_error(400, "Invalid filename"); break; }
+                char dst_txt[1024], dst_meta[1024];
+                snprintf(dst_txt, sizeof(dst_txt),  STORAGE_ROOT "/%s", outname);
+                snprintf(dst_meta, sizeof(dst_meta), STORAGE_ROOT "/%s.meta", outname);
+                if (file_exists(dst_txt) || file_exists(dst_meta)) { nm_send_error(409, "File already exists"); break; }
+                // Ensure root exists
+                if (ensure_dir(STORAGE_ROOT) != 0) { nm_send_error(500, "Storage dir error"); break; }
+                // Move back
+                if (rename(src_txt, dst_txt) != 0) { nm_send_error(404, "Not in trash"); break; }
+                if (rename(src_meta, dst_meta) != 0) { // rollback
+                    rename(dst_txt, src_txt);
+                    nm_send_error(500, "Recover failed"); break;
+                }
+                // Update updated timestamp
+                FILE* mf = fopen(dst_meta, "a"); if (mf) { fprintf(mf, "recovered:%lld\n", (long long)time(NULL)); fclose(mf);}                
+                MsgHeader ack = { .command = CMD_ACK, .payload_size = 0 };
+                send_all(nm_socket, &ack, sizeof(ack));
+                break;
+            }
+            case CMD_TRASH_EMPTY: {
+                if (header.payload_size != sizeof(MsgTrashEmpty)) { nm_send_error(400, "Bad payload size"); break; }
+                MsgTrashEmpty msg; if (!recv_all(nm_socket, &msg, sizeof(msg))) { nm_send_error(400, "Payload read failed"); break; }
+                char base[512]; snprintf(base, sizeof(base), STORAGE_ROOT "/.trash/%s", msg.owner);
+                int errs = 0; int acted = 0;
+                if (msg.all) {
+                    DIR* d = opendir(base);
+                    if (d) {
+                        struct dirent* de; while ((de=readdir(d))!=NULL) {
+                            const char* name = de->d_name; if (strcmp(name, ".")==0 || strcmp(name, "..")==0) continue;
+                            size_t nlen = strlen(name); if (nlen > 5 && strcmp(name + nlen - 5, ".meta") == 0) continue;
+                            char t1[1024], t2[1024]; snprintf(t1,sizeof(t1), "%s/%s", base, name); snprintf(t2,sizeof(t2), "%s/%s.meta", base, name);
+                            remove(t1); remove(t2); acted=1;
+                        }
+                        closedir(d);
+                    }
+                } else if (msg.filename[0]) {
+                    char t1[1024], t2[1024]; snprintf(t1,sizeof(t1), "%s/%s", base, msg.filename); snprintf(t2,sizeof(t2), "%s/%s.meta", base, msg.filename);
+                    if (remove(t1)!=0) errs++; if (remove(t2)!=0) errs++; acted=1;
+                }
+                if (!acted) { nm_send_error(404, "Nothing to remove"); break; }
+                if (errs) { nm_send_error(500, "Some items could not be removed"); break; }
+                MsgHeader ack = (MsgHeader){ .command = CMD_ACK, .payload_size = 0 };
+                send_all(nm_socket, &ack, sizeof(ack));
+                break;
+            }
             case CMD_CREATE_FILE: {
                 if (header.payload_size != sizeof(MsgCreateFile)) {
                     nm_send_error(400, "Bad payload size");
@@ -1142,8 +1327,9 @@ void* listen_to_nm(void* arg) {
                         const char* name = ent->d_name;
                         // Skip . and ..
                         if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
-                        // Skip internal undo directory
+                        // Skip internal directories
                         if (strcmp(name, ".undo") == 0) continue;
+                        if (strcmp(name, ".trash") == 0) continue;
                         // Skip metadata files
                         size_t nlen = strlen(name);
                         if (nlen > 5 && strcmp(name + nlen - 5, ".meta") == 0) continue;
@@ -1196,7 +1382,7 @@ void* listen_to_nm(void* arg) {
                 }
                 int rc = ss_delete_file_do(msg.filename);
                 if (rc == 0) {
-                    LOG_SS("Deleted file '%s'\n", msg.filename);
+                    LOG_SS("Moved file '%s' to trash for owner '%s'\n", msg.filename, owner);
                     MsgHeader ack = { .command = CMD_ACK, .payload_size = 0 };
                     send_all(nm_socket, &ack, sizeof(ack));
                 } else {
@@ -1221,12 +1407,14 @@ void* listen_to_nm(void* arg) {
                 if (!mf) { nm_send_error(404, "File not found"); break; }
                 char owner[MAX_USERNAME_LEN] = {0};
                 long long created=0, updated=0;
+                long long accessed_keep = 0; // preserve last accessed timestamp if present
                 char readers[1024] = {0}, writers[1024] = {0};
                 char line[2048];
                 while (fgets(line, sizeof(line), mf)) {
                     if (strncmp(line, "owner:", 6) == 0) { sscanf(line+6, "%63s", owner); }
                     else if (strncmp(line, "created:", 8) == 0) { sscanf(line+8, "%lld", &created); }
                     else if (strncmp(line, "updated:", 8) == 0) { sscanf(line+8, "%lld", &updated); }
+                    else if (strncmp(line, "accessed:", 9) == 0) { long long t=0; if (sscanf(line+9, "%lld", &t)==1) { if (t>accessed_keep) accessed_keep=t; } }
                     else if (strncmp(line, "readers:", 8) == 0) { strncpy(readers, line+8, sizeof(readers)-1); }
                     else if (strncmp(line, "writers:", 8) == 0) { strncpy(writers, line+8, sizeof(writers)-1); }
                 }
@@ -1245,6 +1433,10 @@ void* listen_to_nm(void* arg) {
                     if (msg.is_writer) {
                         if (list_contains(writers, msg.target)) { nm_send_error(409, "User already has writer access"); break; }
                         list_append(writers, sizeof(writers), msg.target);
+                        // Ensure writers are also listed as readers
+                        if (!list_contains(readers, msg.target)) {
+                            list_append(readers, sizeof(readers), msg.target);
+                        }
                     } else {
                         if (list_contains(readers, msg.target)) { nm_send_error(409, "User already has reader access"); break; }
                         list_append(readers, sizeof(readers), msg.target);
@@ -1265,6 +1457,7 @@ void* listen_to_nm(void* arg) {
                 fprintf(mf, "owner:%s\n", owner);
                 fprintf(mf, "created:%lld\n", created);
                 fprintf(mf, "updated:%lld\n", updated);
+                if (accessed_keep > 0) { fprintf(mf, "accessed:%lld\n", accessed_keep); }
                 fprintf(mf, "readers:%s%s\n", (readers[0]?" ":""), readers);
                 fprintf(mf, "writers:%s%s\n", (writers[0]?" ":""), writers);
                 fclose(mf);
@@ -1282,11 +1475,13 @@ void* listen_to_nm(void* arg) {
                 char owner[MAX_USERNAME_LEN] = {0};
                 long long created=0, updated=0;
                 char readers[1024] = {0}, writers[1024] = {0};
+                long long accessed_meta = 0;
                 char line[2048];
                 while (fgets(line, sizeof(line), mf)) {
                     if (strncmp(line, "owner:", 6) == 0) { sscanf(line+6, "%63s", owner); }
                     else if (strncmp(line, "created:", 8) == 0) { sscanf(line+8, "%lld", &created); }
                     else if (strncmp(line, "updated:", 8) == 0) { sscanf(line+8, "%lld", &updated); }
+                    else if (strncmp(line, "accessed:", 9) == 0) { sscanf(line+9, "%lld", &accessed_meta); }
                     else if (strncmp(line, "readers:", 8) == 0) { strncpy(readers, line+8, sizeof(readers)-1); }
                     else if (strncmp(line, "writers:", 8) == 0) { strncpy(writers, line+8, sizeof(writers)-1); }
                 }
@@ -1299,6 +1494,7 @@ void* listen_to_nm(void* arg) {
                 struct stat st; memset(&st, 0, sizeof(st)); int have_stat = (stat(path, &st) == 0);
                 long long size_bytes = have_stat ? (long long)st.st_size : 0;
                 long long last_access = have_stat ? (long long)st.st_atime : 0;
+                if (accessed_meta > 0 && accessed_meta > last_access) last_access = accessed_meta;
                 // Count words and chars
                 long long chars_cnt = 0, words_cnt = 0;
                 FILE* f = fopen(path, "rb");
@@ -1317,6 +1513,7 @@ void* listen_to_nm(void* arg) {
                 char created_buf[64]={0}, updated_buf[64]={0};
                 char access_buf[64]={0}, mod_buf[64]={0};
                 long long last_modified = have_stat ? (long long)st.st_mtime : 0;
+                if (updated > 0 && updated > last_modified) last_modified = updated;
                 time_t cr=(time_t)created, up=(time_t)updated, ac=(time_t)last_access, mo=(time_t)last_modified;
                 struct tm tmv;
                 if (localtime_r(&cr, &tmv)) strftime(created_buf, sizeof(created_buf), "%Y-%m-%d %H:%M:%S", &tmv);
@@ -1368,6 +1565,193 @@ void* listen_to_nm(void* arg) {
                 } else {
                     nm_send_error(404, err[0]?err:"No undo available");
                 }
+                break;
+            }
+            // --- ACCESS REQUEST CREATE ---
+            case CMD_REQUEST_ACCESS: {
+                if (header.payload_size != sizeof(MsgAccessRequestCreate)) { nm_send_error(400, "Bad payload size"); break; }
+                MsgAccessRequestCreate msg; if(!recv_all(nm_socket,&msg,sizeof(msg))){ nm_send_error(400,"Payload read failed"); break; }
+                if(!is_valid_filename(msg.filename)){ nm_send_error(400,"Invalid filename"); break; }
+                // Validate requester presence
+                if(msg.requester[0]=='\0'){ nm_send_error(403,"Unauthorized"); break; }
+                // Owner or writer already? Then no need to request — respond with conflict
+                char meta[512]; snprintf(meta,sizeof(meta), STORAGE_ROOT "/%s.meta", msg.filename); FILE* mf=fopen(meta,"r"); if(!mf){ nm_send_error(404,"File not found"); break; }
+                char owner[MAX_USERNAME_LEN]={0}; char readers[1024]={0}; char writers[1024]={0}; char line[2048];
+                while(fgets(line,sizeof(line),mf)){
+                    if(strncmp(line,"owner:",6)==0){ sscanf(line+6,"%63s",owner); }
+                    else if(strncmp(line,"readers:",8)==0){ strncpy(readers,line+8,sizeof(readers)-1); }
+                    else if(strncmp(line,"writers:",8)==0){ strncpy(writers,line+8,sizeof(writers)-1); }
+                }
+                fclose(mf);
+                trim_both(readers); trim_both(writers);
+                if( (owner[0] && strncmp(owner,msg.requester,MAX_USERNAME_LEN)==0) || list_contains(readers,msg.requester) || list_contains(writers,msg.requester) ){
+                    nm_send_error(409,"Already has access"); break; }
+                // Prepare request file
+                char rdir[512]; if(ensure_requests_dir_for(msg.filename,rdir,sizeof(rdir))!=0){ nm_send_error(500,"Dir error"); break; }
+                char rpath[700]; snprintf(rpath,sizeof(rpath), "%s/%s.req", rdir, msg.requester);
+                if(file_exists(rpath)){ nm_send_error(409,"Request exists"); break; }
+                FILE* rf=fopen(rpath,"w"); if(!rf){ nm_send_error(500,"Create failed"); break; }
+                fprintf(rf, "%s\n", msg.want_write?"WRITE":"READ"); fclose(rf);
+                MsgHeader ack={ .command=CMD_ACK, .payload_size=0 }; send_all(nm_socket,&ack,sizeof(ack));
+                break;
+            }
+            // --- ACCESS REQUEST LIST ---
+            case CMD_LIST_REQUESTS: {
+                if(header.payload_size != sizeof(MsgAccessRequestList)){ nm_send_error(400,"Bad payload size"); break; }
+                MsgAccessRequestList msg; if(!recv_all(nm_socket,&msg,sizeof(msg))){ nm_send_error(400,"Payload read failed"); break; }
+                if(!is_valid_filename(msg.filename)){ nm_send_error(400,"Invalid filename"); break; }
+                // Owner auth
+                char meta[512]; snprintf(meta,sizeof(meta), STORAGE_ROOT "/%s.meta", msg.filename); FILE* mf=fopen(meta,"r"); if(!mf){ nm_send_error(404,"File not found"); break; }
+                char owner[MAX_USERNAME_LEN]={0}; char line[2048]; while(fgets(line,sizeof(line),mf)){ if(strncmp(line,"owner:",6)==0){ sscanf(line+6,"%63s",owner); break; } } fclose(mf);
+                if(!(owner[0] && msg.requester[0] && strncmp(owner,msg.requester,MAX_USERNAME_LEN)==0)){ nm_send_error(403,"Only owner"); break; }
+                char rdir[512]; if(ensure_requests_dir_for(msg.filename,rdir,sizeof(rdir))!=0){ // empty list if no dir
+                    MsgAccessRequestListResp resp={0}; MsgHeader h={ .command=CMD_LIST_REQUESTS_RESP, .payload_size=sizeof(resp)}; send_all(nm_socket,&h,sizeof(h)); send_all(nm_socket,&resp,sizeof(resp)); break; }
+                DIR* d=opendir(rdir); MsgAccessRequestListResp resp={0}; size_t pos=0; if(d){ struct dirent* ent; while((ent=readdir(d))!=NULL){ if(strcmp(ent->d_name,".")==0||strcmp(ent->d_name,"..")==0) continue; size_t elen=strlen(ent->d_name); if(elen>4 && strcmp(ent->d_name+elen-4,".req")==0){ char user[MAX_USERNAME_LEN]={0}; size_t ulen=elen-4; if(ulen >= MAX_USERNAME_LEN) ulen=MAX_USERNAME_LEN-1; memcpy(user, ent->d_name, ulen); char fpath[700]; snprintf(fpath,sizeof(fpath), "%s/%s", rdir, ent->d_name); FILE* rf=fopen(fpath,"r"); if(rf){ char typ[16]={0}; if(fgets(typ,sizeof(typ),rf)){ typ[strcspn(typ,"\r\n")]=0; char linebuf[256]; snprintf(linebuf,sizeof(linebuf), "%s\t%s\n", user, strcmp(typ,"WRITE")==0?"WRITE":"READ"); size_t ln=strlen(linebuf); if(pos+ln < sizeof(resp.requests)){ memcpy(resp.requests+pos,linebuf,ln); pos+=ln; } } fclose(rf);} } }
+                    closedir(d); }
+                MsgHeader h={ .command=CMD_LIST_REQUESTS_RESP, .payload_size=sizeof(resp)}; send_all(nm_socket,&h,sizeof(h)); send_all(nm_socket,&resp,sizeof(resp));
+                break;
+            }
+            // --- ACCESS REQUEST RESPOND ---
+            case CMD_RESPOND_REQUEST: {
+                if(header.payload_size != sizeof(MsgAccessRequestRespond)){ nm_send_error(400,"Bad payload size"); break; }
+                MsgAccessRequestRespond msg; if(!recv_all(nm_socket,&msg,sizeof(msg))){ nm_send_error(400,"Payload read failed"); break; }
+                if(!is_valid_filename(msg.filename)){ nm_send_error(400,"Invalid filename"); break; }
+                // Owner auth
+                char meta[512]; snprintf(meta,sizeof(meta), STORAGE_ROOT "/%s.meta", msg.filename); FILE* mf=fopen(meta,"r"); if(!mf){ nm_send_error(404,"File not found"); break; }
+                char owner[MAX_USERNAME_LEN]={0}; long long created=0, updated=0; long long accessed_keep=0; char readers[1024]={0}, writers[1024]={0}; char line[2048];
+                while(fgets(line,sizeof(line),mf)){
+                    if(strncmp(line,"owner:",6)==0){ sscanf(line+6,"%63s",owner); }
+                    else if(strncmp(line,"created:",8)==0){ sscanf(line+8,"%lld", &created); }
+                    else if(strncmp(line,"updated:",8)==0){ sscanf(line+8,"%lld", &updated); }
+                    else if(strncmp(line,"accessed:",9)==0){ long long t=0; if(sscanf(line+9, "%lld", &t)==1){ if(t>accessed_keep) accessed_keep=t; } }
+                    else if(strncmp(line,"readers:",8)==0){ strncpy(readers,line+8,sizeof(readers)-1); }
+                    else if(strncmp(line,"writers:",8)==0){ strncpy(writers,line+8,sizeof(writers)-1); }
+                }
+                fclose(mf); trim_both(readers); trim_both(writers);
+                if(!(owner[0] && msg.requester[0] && strncmp(owner,msg.requester,MAX_USERNAME_LEN)==0)){ nm_send_error(403,"Only owner"); break; }
+                char rdir[512]; if(ensure_requests_dir_for(msg.filename,rdir,sizeof(rdir))!=0){ nm_send_error(404,"No requests" ); break; }
+                char rpath[700]; snprintf(rpath,sizeof(rpath), "%s/%s.req", rdir, msg.target);
+                if(!file_exists(rpath)){ nm_send_error(404,"Request not found"); break; }
+                if(msg.approve){
+                    // Grant access: update metadata lists
+                    if(msg.grant_write){
+                        if(!list_contains(writers,msg.target)) list_append(writers,sizeof(writers),msg.target);
+                        // Ensure writers are also listed as readers
+                        if(!list_contains(readers,msg.target)) list_append(readers,sizeof(readers),msg.target);
+                    } else {
+                        if(!list_contains(readers,msg.target) && !list_contains(writers,msg.target)) list_append(readers,sizeof(readers),msg.target);
+                    }
+                    time_t now=time(NULL); updated=(long long)now;
+                    FILE* mw=fopen(meta,"w"); if(!mw){ nm_send_error(500,"Meta write failed"); break; }
+                    fprintf(mw,"owner:%s\ncreated:%lld\nupdated:%lld\n", owner, created, updated);
+                    if(accessed_keep>0){ fprintf(mw, "accessed:%lld\n", accessed_keep); }
+                    fprintf(mw,"readers:%s%s\n", (readers[0]?" ":""), readers);
+                    fprintf(mw,"writers:%s%s\n", (writers[0]?" ":""), writers);
+                    fclose(mw);
+                }
+                remove(rpath); // remove request regardless of approve/deny
+                MsgHeader ack={ .command=CMD_ACK, .payload_size=0 }; send_all(nm_socket,&ack,sizeof(ack));
+                break;
+            }
+            // --- CHECKPOINT CREATE ---
+            case CMD_CHECKPOINT_CREATE: {
+                if (header.payload_size != sizeof(MsgCheckpointCreate)) { nm_send_error(400, "Bad payload size"); break; }
+                MsgCheckpointCreate msg; if (!recv_all(nm_socket, &msg, sizeof(msg))) { nm_send_error(400, "Payload read failed"); break; }
+                if (!is_valid_filename(msg.filename)) { nm_send_error(400, "Invalid filename"); break; }
+                // Validate tag (allow [A-Za-z0-9-_], length 1..64)
+                size_t tlen = strnlen(msg.tag, sizeof(msg.tag));
+                if (tlen == 0 || tlen > 64) { nm_send_error(400, "Invalid tag length"); break; }
+                int tag_ok = 1; for (size_t i=0;i<tlen;i++){ char c=msg.tag[i]; if(!(isalnum((unsigned char)c)||c=='-'||c=='_')){ tag_ok=0; break; }}
+                if (!tag_ok) { nm_send_error(400, "Invalid tag chars"); break; }
+                // ACL: owner or writer can create checkpoint
+                char meta[512]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", msg.filename); FILE* mf=fopen(meta,"r"); if(!mf){ nm_send_error(404,"File not found"); break; }
+                char owner[MAX_USERNAME_LEN]={0}; char writers[1024]={0}; char line[2048]; while(fgets(line,sizeof(line),mf)){ if(strncmp(line,"owner:",6)==0){ sscanf(line+6, "%63s", owner);} else if(strncmp(line,"writers:",8)==0){ strncpy(writers,line+8,sizeof(writers)-1);} } fclose(mf); trim_both(writers);
+                if(!( (owner[0]&&msg.requester[0]&&strncmp(owner,msg.requester,MAX_USERNAME_LEN)==0) || list_contains(writers,msg.requester) )){ nm_send_error(403,"Write access denied"); break; }
+                // Ensure no active sentence locks on this file to keep snapshot consistent
+                if (sentence_lock_any_for_file(msg.filename)) { nm_send_error(423, "Active write lock"); break; }
+                // Prepare checkpoint directory
+                char chkroot[512]; snprintf(chkroot,sizeof(chkroot), STORAGE_ROOT "/.checkpoints"); if(ensure_dir(STORAGE_ROOT)!=0 || ensure_dir(chkroot)!=0){ nm_send_error(500,"Storage dir error"); break; }
+                char filedir[512]; snprintf(filedir,sizeof(filedir), STORAGE_ROOT "/.checkpoints/%s", msg.filename); if(ensure_dir(filedir)!=0){ nm_send_error(500,"Checkpoint dir error"); break; }
+                // Source file path
+                char srcpath[512]; snprintf(srcpath,sizeof(srcpath), STORAGE_ROOT "/%s", msg.filename); FILE* src=fopen(srcpath,"rb"); if(!src){ nm_send_error(404,"File not found"); break; }
+                // Destination checkpoint path (tag)
+                char dstpath[700]; snprintf(dstpath,sizeof(dstpath), "%s/%s", filedir, msg.tag);
+                // Fail if already exists
+                if (file_exists(dstpath)) { fclose(src); nm_send_error(409, "Tag exists"); break; }
+                FILE* dst=fopen(dstpath,"wb"); if(!dst){ fclose(src); nm_send_error(500,"Open checkpoint failed"); break; }
+                char buf[4096]; size_t n; while((n=fread(buf,1,sizeof(buf),src))>0){ if(fwrite(buf,1,n,dst)!=n){ fclose(src); fclose(dst); nm_send_error(500,"Write checkpoint failed"); goto chk_create_end; }}
+                fclose(src); fclose(dst);
+                {
+                    MsgHeader ack = { .command = CMD_ACK, .payload_size = 0 }; send_all(nm_socket,&ack,sizeof(ack));
+                }
+chk_create_end:
+                break;
+            }
+            // --- CHECKPOINT LIST ---
+            case CMD_CHECKPOINT_LIST: {
+                if (header.payload_size != sizeof(MsgCheckpointList)) { nm_send_error(400, "Bad payload size"); break; }
+                MsgCheckpointList msg; if(!recv_all(nm_socket,&msg,sizeof(msg))){ nm_send_error(400,"Payload read failed"); break; }
+                if(!is_valid_filename(msg.filename)){ nm_send_error(400,"Invalid filename"); break; }
+                // ACL: read permission (owner/readers/writers)
+                char meta[512]; snprintf(meta,sizeof(meta), STORAGE_ROOT "/%s.meta", msg.filename); FILE* mf=fopen(meta,"r"); if(!mf){ nm_send_error(404,"File not found"); break; }
+                char owner[MAX_USERNAME_LEN]={0}; char readers[1024]={0}; char writers[1024]={0}; char line[2048]; while(fgets(line,sizeof(line),mf)){ if(strncmp(line,"owner:",6)==0){ sscanf(line+6,"%63s",owner);} else if(strncmp(line,"readers:",8)==0){ strncpy(readers,line+8,sizeof(readers)-1);} else if(strncmp(line,"writers:",8)==0){ strncpy(writers,line+8,sizeof(writers)-1);} } fclose(mf); trim_both(readers); trim_both(writers);
+                if(!( (owner[0]&&msg.requester[0]&&strncmp(owner,msg.requester,MAX_USERNAME_LEN)==0) || list_contains(readers,msg.requester) || list_contains(writers,msg.requester) )){ nm_send_error(403,"Unauthorized"); break; }
+                char filedir[512]; snprintf(filedir,sizeof(filedir), STORAGE_ROOT "/.checkpoints/%s", msg.filename);
+                MsgCheckpointListResponse resp = {0};
+                DIR* d = opendir(filedir);
+                if(d){ struct dirent* ent; size_t pos=0; while((ent=readdir(d))!=NULL){ if(strcmp(ent->d_name,".")==0||strcmp(ent->d_name,"..")==0) continue; size_t ln=strlen(ent->d_name); if(pos+ln+1 < sizeof(resp.tags)){ memcpy(resp.tags+pos, ent->d_name, ln); pos+=ln; resp.tags[pos++]='\n'; } }
+                    closedir(d);
+                }
+                MsgHeader hresp = { .command = CMD_CHECKPOINT_LIST_RESP, .payload_size = sizeof(resp) }; send_all(nm_socket,&hresp,sizeof(hresp)); send_all(nm_socket,&resp,sizeof(resp));
+                break;
+            }
+            // --- CHECKPOINT VIEW ---
+            case CMD_CHECKPOINT_VIEW: {
+                if(header.payload_size != sizeof(MsgCheckpointView)){ nm_send_error(400,"Bad payload size"); break; }
+                MsgCheckpointView msg; if(!recv_all(nm_socket,&msg,sizeof(msg))){ nm_send_error(400,"Payload read failed"); break; }
+                if(!is_valid_filename(msg.filename)){ nm_send_error(400,"Invalid filename"); break; }
+                size_t tlen=strnlen(msg.tag,sizeof(msg.tag)); if(tlen==0||tlen>64){ nm_send_error(400,"Invalid tag"); break; }
+                int tag_ok=1; for(size_t i=0;i<tlen;i++){ char c=msg.tag[i]; if(!(isalnum((unsigned char)c)||c=='-'||c=='_')){ tag_ok=0; break; }} if(!tag_ok){ nm_send_error(400,"Invalid tag chars"); break; }
+                // ACL read
+                char meta[512]; snprintf(meta,sizeof(meta), STORAGE_ROOT "/%s.meta", msg.filename); FILE* mf=fopen(meta,"r"); if(!mf){ nm_send_error(404,"File not found"); break; }
+                char owner[MAX_USERNAME_LEN]={0}; char readers[1024]={0}; char writers[1024]={0}; char line[2048]; while(fgets(line,sizeof(line),mf)){ if(strncmp(line,"owner:",6)==0){ sscanf(line+6,"%63s",owner);} else if(strncmp(line,"readers:",8)==0){ strncpy(readers,line+8,sizeof(readers)-1);} else if(strncmp(line,"writers:",8)==0){ strncpy(writers,line+8,sizeof(writers)-1);} } fclose(mf); trim_both(readers); trim_both(writers);
+                if(!( (owner[0]&&msg.requester[0]&&strncmp(owner,msg.requester,MAX_USERNAME_LEN)==0) || list_contains(readers,msg.requester) || list_contains(writers,msg.requester) )){ nm_send_error(403,"Unauthorized"); break; }
+                char chkpath[700]; snprintf(chkpath,sizeof(chkpath), STORAGE_ROOT "/.checkpoints/%s/%s", msg.filename, msg.tag); struct stat st; if(stat(chkpath,&st)!=0||!S_ISREG(st.st_mode)){ nm_send_error(404,"Checkpoint not found"); break; }
+                FILE* f=fopen(chkpath,"rb"); if(!f){ nm_send_error(500,"Open failed"); break; }
+                MsgHeader ack = { .command = CMD_ACK, .payload_size = (int)st.st_size }; if(!send_all(nm_socket,&ack,sizeof(ack))){ fclose(f); break; }
+                char buf[4096]; size_t rem = (size_t)st.st_size; while(rem>0){ size_t chunk = rem>sizeof(buf)?sizeof(buf):rem; size_t nr=fread(buf,1,chunk,f); if(nr==0) break; if(!send_all(nm_socket,buf,nr)) break; rem -= nr; }
+                fclose(f);
+                break;
+            }
+            // --- CHECKPOINT REVERT ---
+            case CMD_CHECKPOINT_REVERT: {
+                if(header.payload_size != sizeof(MsgCheckpointRevert)){ nm_send_error(400,"Bad payload size"); break; }
+                MsgCheckpointRevert msg; if(!recv_all(nm_socket,&msg,sizeof(msg))){ nm_send_error(400,"Payload read failed"); break; }
+                if(!is_valid_filename(msg.filename)){ nm_send_error(400,"Invalid filename"); break; }
+                size_t tlen=strnlen(msg.tag,sizeof(msg.tag)); if(tlen==0||tlen>64){ nm_send_error(400,"Invalid tag"); break; }
+                int tag_ok=1; for(size_t i=0;i<tlen;i++){ char c=msg.tag[i]; if(!(isalnum((unsigned char)c)||c=='-'||c=='_')){ tag_ok=0; break; }} if(!tag_ok){ nm_send_error(400,"Invalid tag chars"); break; }
+                // ACL: owner or writer; also ensure no active sentence locks
+                char meta[512]; snprintf(meta,sizeof(meta), STORAGE_ROOT "/%s.meta", msg.filename); FILE* mf=fopen(meta,"r"); if(!mf){ nm_send_error(404,"File not found"); break; }
+                char owner[MAX_USERNAME_LEN]={0}; char writers[1024]={0}; char line[2048]; while(fgets(line,sizeof(line),mf)){ if(strncmp(line,"owner:",6)==0){ sscanf(line+6,"%63s", owner);} else if(strncmp(line,"writers:",8)==0){ strncpy(writers,line+8,sizeof(writers)-1);} } fclose(mf); trim_both(writers);
+                if(!( (owner[0]&&msg.requester[0]&&strncmp(owner,msg.requester,MAX_USERNAME_LEN)==0) || list_contains(writers,msg.requester) )){ nm_send_error(403,"Write access denied"); break; }
+                if(sentence_lock_any_for_file(msg.filename)){ nm_send_error(423,"Active write lock"); break; }
+                char chkpath[700]; snprintf(chkpath,sizeof(chkpath), STORAGE_ROOT "/.checkpoints/%s/%s", msg.filename, msg.tag); struct stat st; if(stat(chkpath,&st)!=0||!S_ISREG(st.st_mode)){ nm_send_error(404,"Checkpoint not found"); break; }
+                // Replace content file atomically via temp
+                char content[512]; snprintf(content,sizeof(content), STORAGE_ROOT "/%s", msg.filename); FILE* src=fopen(chkpath,"rb"); if(!src){ nm_send_error(500,"Open failed"); break; }
+                char tmppath[700]; snprintf(tmppath,sizeof(tmppath), "%s.tmp", content); FILE* dst=fopen(tmppath,"wb"); if(!dst){ fclose(src); nm_send_error(500,"Tmp failed"); break; }
+                char buf[4096]; size_t n; while((n=fread(buf,1,sizeof(buf),src))>0){ if(fwrite(buf,1,n,dst)!=n){ fclose(src); fclose(dst); remove(tmppath); nm_send_error(500,"Write failed"); goto chk_revert_end; }} fclose(src); fclose(dst); if(rename(tmppath,content)!=0){ remove(tmppath); nm_send_error(500,"Replace failed"); goto chk_revert_end; }
+                // Update metadata 'updated' while preserving 'accessed' and ACL
+                {
+                    char owner_k[MAX_USERNAME_LEN]={0}; long long created_k=0; long long accessed_keep=0; char readers_k[1024]={0}, writers_k[1024]={0};
+                    FILE* mfr=fopen(meta,"r"); if(mfr){ char lb[2048]; while(fgets(lb,sizeof(lb),mfr)){
+                        if(strncmp(lb,"owner:",6)==0){ sscanf(lb+6, "%63s", owner_k); }
+                        else if(strncmp(lb,"created:",8)==0){ sscanf(lb+8, "%lld", &created_k); }
+                        else if(strncmp(lb,"accessed:",9)==0){ long long t=0; if(sscanf(lb+9, "%lld", &t)==1 && t>accessed_keep) accessed_keep=t; }
+                        else if(strncmp(lb,"readers:",8)==0){ strncpy(readers_k,lb+8,sizeof(readers_k)-1); }
+                        else if(strncmp(lb,"writers:",8)==0){ strncpy(writers_k,lb+8,sizeof(writers_k)-1); }
+                    } fclose(mfr); trim_both(readers_k); trim_both(writers_k);} FILE* mfw=fopen(meta,"w"); if(mfw){ time_t now=time(NULL); fprintf(mfw,"owner:%s\ncreated:%lld\nupdated:%lld\n", owner_k, created_k, (long long)now); if(accessed_keep>0) fprintf(mfw,"accessed:%lld\n", accessed_keep); fprintf(mfw,"readers:%s%s\n", (readers_k[0]?" ":""), readers_k); fprintf(mfw,"writers:%s%s\n", (writers_k[0]?" ":""), writers_k); fclose(mfw);} }
+                MsgHeader ack={ .command=CMD_ACK, .payload_size=0 }; send_all(nm_socket,&ack,sizeof(ack));
+chk_revert_end:
                 break;
             }
             default:
