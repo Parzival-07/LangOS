@@ -9,6 +9,8 @@
 #include <stdio.h> // for perror
 #include <stdarg.h>
 #include <time.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 // --- CONFIGURATION ---
 
@@ -32,6 +34,7 @@ typedef enum {
     // File operations
     CMD_CREATE_FILE = 300,
     CMD_DELETE_FILE = 301,
+    CMD_CLEAR_FILE  = 302,
 
     // View/listing operations
     // Client <-> NM
@@ -72,7 +75,26 @@ typedef enum {
     CMD_LIST_USERS_RESP = 381,
 
     // Execute file contents as shell commands (on Name Server)
-    CMD_EXEC = 390
+    CMD_EXEC = 390,
+
+    // Checkpoint operations
+    CMD_CHECKPOINT_CREATE = 400,      // Create a named checkpoint snapshot
+    CMD_CHECKPOINT_VIEW = 401,        // View contents of a named checkpoint
+    CMD_CHECKPOINT_REVERT = 402,      // Revert file content to a named checkpoint
+    CMD_CHECKPOINT_LIST = 403,        // List all checkpoint tags for a file
+    CMD_CHECKPOINT_LIST_RESP = 404    // Response containing list of checkpoint tags
+    ,
+    // Access request workflow
+    CMD_REQUEST_ACCESS = 410,         // User requests read or write access
+    CMD_LIST_REQUESTS = 411,          // Owner lists pending access requests
+    CMD_LIST_REQUESTS_RESP = 412,     // Response: list of requests
+    CMD_RESPOND_REQUEST = 413         // Owner approves or denies a request
+        ,
+        // Trash bin operations
+        CMD_TRASH_LIST = 420,
+        CMD_TRASH_LIST_RESP = 421,
+        CMD_TRASH_RECOVER = 422,
+        CMD_TRASH_EMPTY = 423
 } CommandCode;
 
 // --- DATA STRUCTURES ---
@@ -116,6 +138,13 @@ typedef struct {
     char filename[MAX_FILENAME_LEN];
     char requester[MAX_USERNAME_LEN]; // NM will overwrite with authenticated username
 } MsgDeleteFile;
+
+// Data for CMD_CLEAR_FILE
+// Client -> NM -> SS
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+    char requester[MAX_USERNAME_LEN]; // NM will overwrite with authenticated username
+} MsgClearFile;
 
 // Data for CMD_VIEW_FILES_RESP
 // NM -> Client: newline-separated list of filenames
@@ -173,7 +202,93 @@ typedef struct {
 typedef struct {
     char info[2048];
 } MsgInfoResponse;
+
+// --- CHECKPOINT MESSAGES ---
+// Client -> NM -> SS (create)
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+    char tag[128];                   // checkpoint tag (sanitized on SS)
+    char requester[MAX_USERNAME_LEN];
+} MsgCheckpointCreate;
+
+// Client -> NM -> SS (view)
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+    char tag[128];
+    char requester[MAX_USERNAME_LEN];
+} MsgCheckpointView;
+
+// Client -> NM -> SS (revert)
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+    char tag[128];
+    char requester[MAX_USERNAME_LEN];
+} MsgCheckpointRevert;
+
+// Client -> NM -> SS (list)
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+    char requester[MAX_USERNAME_LEN];
+} MsgCheckpointList;
+
+// NM -> Client (list response)
+typedef struct {
+    char tags[16384]; // newline-separated list of checkpoint tags
+} MsgCheckpointListResponse;
+
+// --- ACCESS REQUEST MESSAGES ---
+// Client -> NM -> SS: create a request
+typedef struct {
+    char filename[MAX_FILENAME_LEN];   // target file
+    int  want_write;                   // 0 = read, 1 = write
+    char requester[MAX_USERNAME_LEN];  // NM overwrites with authenticated user
+} MsgAccessRequestCreate;
+
+// Client (owner) -> NM -> SS: list pending requests
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+    char requester[MAX_USERNAME_LEN]; // owner (auth at NM)
+} MsgAccessRequestList;
+
+// SS -> NM -> Client: list response (each line: requester TAB type)
+typedef struct {
+    char requests[16384]; // newline-separated entries: username[TAB]type (READ/WRITE)
+} MsgAccessRequestListResp;
+
+// Client (owner) -> NM -> SS: respond to a request
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+    char target[MAX_USERNAME_LEN];   // user whose request is being answered
+    int  approve;                    // 1 = approve, 0 = deny
+    int  grant_write;                // if approving: 1=writer, 0=reader (ignored if deny)
+    char requester[MAX_USERNAME_LEN]; // owner (auth at NM)
+} MsgAccessRequestRespond;
  
+// --- TRASH BIN MESSAGES ---
+// Client -> NM -> SS: list trashed files for an owner
+typedef struct {
+    char owner[MAX_USERNAME_LEN];
+} MsgTrashList;
+
+// SS -> NM -> Client: list response (newline-separated filenames)
+typedef struct {
+    char files[16384];
+} MsgTrashListResp;
+
+// Client -> NM -> SS: recover a trashed file
+typedef struct {
+    char owner[MAX_USERNAME_LEN];
+    char filename[MAX_FILENAME_LEN];      // original filename in trash
+    char newname[MAX_FILENAME_LEN];       // optional new name; empty means use original
+} MsgTrashRecover;
+
+// Client -> NM -> SS: empty trash (all or single file)
+typedef struct {
+    char owner[MAX_USERNAME_LEN];
+    char filename[MAX_FILENAME_LEN];      // optional; empty means all
+    int  all;                             // 1 = remove all, 0 = remove only filename
+} MsgTrashEmpty;
+
 // Data for CMD_WRITE_BEGIN (direct client -> SS): acquire a sentence lock only
 typedef struct {
     char filename[MAX_FILENAME_LEN];
@@ -307,8 +422,47 @@ static inline void _get_ts(char* buf, size_t n) {
 #define LOGE_NM(fmt, ...)     LOG_ERR_C("NM", fmt, ##__VA_ARGS__)
 #define LOG_SS(fmt, ...)      LOG_INFO_C("SS", fmt, ##__VA_ARGS__)
 #define LOGE_SS(fmt, ...)     LOG_ERR_C("SS", fmt, ##__VA_ARGS__)
-#define LOG_CLIENT(fmt, ...)  LOG_INFO_C("Client", fmt, ##__VA_ARGS__)
-#define LOGE_CLIENT(fmt, ...) LOG_ERR_C("Client", fmt, ##__VA_ARGS__)
+
+// Color-aware client logging (auto-disables when not a TTY or NO_COLOR is set)
+static inline int _term_supports_color_file(FILE* f) {
+    if (getenv("NO_COLOR") != NULL) return 0;
+    if (!f) return 0;
+    int fd = fileno(f);
+    if (fd < 0) return 0;
+    if (!isatty(fd)) return 0;
+    const char* term = getenv("TERM");
+    if (!term || strcmp(term, "dumb") == 0 || strcmp(term, "unknown") == 0) return 0;
+    return 1;
+}
+
+#define ANSI_RED     "\033[31m"
+#define ANSI_GREEN   "\033[32m"
+#define ANSI_YELLOW  "\033[33m"
+#define ANSI_BLUE    "\033[34m"
+#define ANSI_MAGENTA "\033[35m"
+#define ANSI_CYAN    "\033[36m"
+#define ANSI_BOLD    "\033[1m"
+#define ANSI_RESET   "\033[0m"
+
+#undef LOG_CLIENT
+#undef LOGE_CLIENT
+#define LOG_CLIENT(fmt, ...)  do { \
+    char _ts[24]; _get_ts(_ts, sizeof(_ts)); \
+    if (_term_supports_color_file(stdout)) { \
+        fprintf(stdout, "[%s] " ANSI_CYAN "[Client]" ANSI_RESET " " fmt, _ts, ##__VA_ARGS__); \
+    } else { \
+        fprintf(stdout, "[%s] [Client] " fmt, _ts, ##__VA_ARGS__); \
+    } \
+} while(0)
+
+#define LOGE_CLIENT(fmt, ...) do { \
+    char _ts[24]; _get_ts(_ts, sizeof(_ts)); \
+    if (_term_supports_color_file(stderr)) { \
+        fprintf(stderr, "[%s] " ANSI_RED "[Client]" ANSI_RESET " " fmt, _ts, ##__VA_ARGS__); \
+    } else { \
+        fprintf(stderr, "[%s] [Client] " fmt, _ts, ##__VA_ARGS__); \
+    } \
+} while(0)
 
 #endif // PROTOCOL_H
 

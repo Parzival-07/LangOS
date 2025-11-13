@@ -11,6 +11,7 @@
 #include <strings.h>
 #include <signal.h>
 #include <errno.h>
+#include <unistd.h>
 
 int nm_socket;
 char username[MAX_USERNAME_LEN];
@@ -75,7 +76,11 @@ int main() {
     signal(SIGPIPE, SIG_IGN);
 
     // --- Get Username ---
-    printf("Enter your username: ");
+    if (_term_supports_color_file(stdout)) {
+        printf("\033[1;36mEnter your username:\033[0m ");
+    } else {
+        printf("Enter your username: ");
+    }
     if (fgets(username, MAX_USERNAME_LEN, stdin) == NULL) {
     LOGE_CLIENT("Error reading username.\n");
         return 1;
@@ -144,7 +149,11 @@ int main() {
     // --- MAIN REPL (Read-Eval-Print Loop) ---
     char line[1024];
     while (true) {
-        printf("%s> ", username);
+        if (_term_supports_color_file(stdout)) {
+            printf("\033[1;36m%s>\033[0m ", username);
+        } else {
+            printf("%s> ", username);
+        }
         fflush(stdout);
         
         if (fgets(line, sizeof(line), stdin) == NULL) {
@@ -204,7 +213,7 @@ int main() {
             } else {
                 printf("[Client] Unexpected response (%d).\n", rh.command);
             }
-        } else if (strcmp(command, "DELETE") == 0) {
+    } else if (strcmp(command, "DELETE") == 0) {
             char* fname = strtok(NULL, " ");
             if (!fname) {
                 printf("[Client] Usage: DELETE <filename>\n");
@@ -241,6 +250,45 @@ int main() {
                     printf("[Client] DELETE failed (%d): %s\n", err.code, err.message);
                 } else {
                     printf("[Client] DELETE failed (unknown error).\n");
+                }
+            } else {
+                printf("[Client] Unexpected response (%d).\n", rh.command);
+            }
+        } else if (strcmp(command, "CLEAR") == 0) {
+            char* fname = strtok(NULL, " ");
+            if (!fname) {
+                printf("[Client] Usage: CLEAR <filename>\n");
+                continue;
+            }
+
+            MsgHeader h = {0};
+            MsgClearFile payload = {0};
+            h.command = CMD_CLEAR_FILE;
+            h.payload_size = sizeof(MsgClearFile);
+            strncpy(payload.filename, fname, MAX_FILENAME_LEN - 1);
+            strncpy(payload.requester, username, MAX_USERNAME_LEN - 1);
+
+            if (!send_all(nm_socket, &h, sizeof(h)) ||
+                !send_all(nm_socket, &payload, sizeof(payload))) {
+                LOGE_CLIENT("Failed to send CLEAR to NM.\n");
+                continue;
+            }
+
+            // Wait for NM response
+            MsgHeader rh;
+            if (!recv_all(nm_socket, &rh, sizeof(rh))) {
+                LOGE_CLIENT("No response from NM.\n");
+                break; // Exit immediately on NM disconnect
+            }
+
+            if (rh.command == CMD_ACK) {
+                printf("[Client] File '%s' cleared.\n", fname);
+            } else if (rh.command == CMD_ERROR) {
+                MsgError err = {0};
+                if (rh.payload_size == sizeof(MsgError) && recv_all(nm_socket, &err, sizeof(err))) {
+                    printf("[Client] CLEAR failed (%d): %s\n", err.code, err.message);
+                } else {
+                    printf("[Client] CLEAR failed (unknown error).\n");
                 }
             } else {
                 printf("[Client] Unexpected response (%d).\n", rh.command);
@@ -308,6 +356,45 @@ int main() {
                 }
                 printf("[Client] Unexpected response (%d).\n", rh.command);
             }
+        } else if (strcmp(command, "TRASH") == 0) {
+            // List current user's trash across all SS
+            MsgTrashList rq = {0}; strncpy(rq.owner, username, MAX_USERNAME_LEN-1);
+            MsgHeader h = { .command = CMD_TRASH_LIST, .payload_size = sizeof(rq) };
+            if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &rq, sizeof(rq))) { LOGE_CLIENT("Failed to send TRASH list.\n"); continue; }
+            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { LOGE_CLIENT("NM disconnected.\n"); break; }
+            if (rh.command == CMD_TRASH_LIST_RESP && rh.payload_size == sizeof(MsgTrashListResp)) {
+                MsgTrashListResp resp = {0}; if (!recv_all(nm_socket, &resp, sizeof(resp))) { LOGE_CLIENT("Failed to read TRASH payload.\n"); break; }
+                if (resp.files[0] == '\0') printf("[Client] Trash is empty.\n"); else printf("%s", resp.files);
+            } else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) {
+                MsgError err; recv_all(nm_socket, &err, sizeof(err)); printf("[Client] TRASH failed (%d): %s\n", err.code, err.message);
+            } else {
+                // Drain
+                size_t rem = rh.payload_size; char drain[256]; while (rem > 0) { size_t ch = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(nm_socket, drain, ch)) break; rem -= ch; }
+                printf("[Client] Unexpected response to TRASH (%d).\n", rh.command);
+            }
+        } else if (strcmp(command, "RECOVER") == 0) {
+            // RECOVER <filename> [newname]
+            char* fname = strtok(NULL, " "); char* newname = strtok(NULL, " ");
+            if (!fname) { printf("[Client] Usage: RECOVER <filename> [newname]\n"); continue; }
+            MsgTrashRecover rq = {0}; strncpy(rq.owner, username, MAX_USERNAME_LEN-1); strncpy(rq.filename, fname, MAX_FILENAME_LEN-1); if (newname) strncpy(rq.newname, newname, MAX_FILENAME_LEN-1);
+            MsgHeader h = { .command = CMD_TRASH_RECOVER, .payload_size = sizeof(rq) };
+            if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &rq, sizeof(rq))) { LOGE_CLIENT("Failed to send RECOVER.\n"); continue; }
+            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { LOGE_CLIENT("NM disconnected.\n"); break; }
+            if (rh.command == CMD_ACK) { printf("[Client] Recovered '%s'%s%s.\n", fname, newname?" as ":"", newname?newname:""); }
+            else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(nm_socket,&err,sizeof(err)); printf("[Client] RECOVER failed (%d): %s\n", err.code, err.message); }
+            else { size_t rem = rh.payload_size; char drain[256]; while(rem>0){ size_t ch=rem>sizeof(drain)?sizeof(drain):rem; if(!recv_all(nm_socket,drain,ch)) break; rem -= ch; } printf("[Client] Unexpected response to RECOVER (%d).\n", rh.command); }
+        } else if (strcmp(command, "EMPTYTRASH") == 0) {
+            // EMPTYTRASH [-all | <filename>]
+            char* arg = strtok(NULL, " ");
+            MsgTrashEmpty rq = {0}; strncpy(rq.owner, username, MAX_USERNAME_LEN-1);
+            if (!arg || strcasecmp(arg, "-all") == 0) { rq.all = 1; rq.filename[0] = '\0'; }
+            else { rq.all = 0; strncpy(rq.filename, arg, MAX_FILENAME_LEN-1); }
+            MsgHeader h = { .command = CMD_TRASH_EMPTY, .payload_size = sizeof(rq) };
+            if (!send_all(nm_socket, &h, sizeof(h)) || !send_all(nm_socket, &rq, sizeof(rq))) { LOGE_CLIENT("Failed to send EMPTYTRASH.\n"); continue; }
+            MsgHeader rh; if (!recv_all(nm_socket, &rh, sizeof(rh))) { LOGE_CLIENT("NM disconnected.\n"); break; }
+            if (rh.command == CMD_ACK) { if (rq.all) printf("[Client] Emptied trash.\n"); else printf("[Client] Removed '%s' from trash.\n", rq.filename); }
+            else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(nm_socket,&err,sizeof(err)); printf("[Client] EMPTYTRASH failed (%d): %s\n", err.code, err.message); }
+            else { size_t rem=rh.payload_size; char drain[256]; while(rem>0){ size_t ch=rem>sizeof(drain)?sizeof(drain):rem; if(!recv_all(nm_socket,drain,ch)) break; rem -= ch; } printf("[Client] Unexpected response to EMPTYTRASH (%d).\n", rh.command); }
         } else if (strcmp(command, "WRITE") == 0) {
             char* fname = strtok(NULL, " ");
             char* sidx_s = strtok(NULL, " ");
@@ -599,6 +686,7 @@ write_cancel_release:
         } else if (strcmp(command, "INFO") == 0) {
             char* fname = strtok(NULL, " ");
             if (!fname) { printf("[Client] Usage: INFO <filename>\n"); continue; }
+        // Additional command handling for CHECKPOINT, LISTCHECKPOINTS, VIEWCHECKPOINT, REVERT, etc.
             MsgInfoRequest rq = (MsgInfoRequest){0};
             strncpy(rq.filename, fname, MAX_FILENAME_LEN-1);
             MsgHeader h = { .command = CMD_INFO, .payload_size = sizeof(rq) };
@@ -616,6 +704,47 @@ write_cancel_release:
                 size_t rem = rh.payload_size; char drain[256]; while (rem > 0) { size_t chunk = rem > sizeof(drain)?sizeof(drain):rem; if (!recv_all(nm_socket, drain, chunk)) break; rem -= chunk; }
                 printf("[Client] Unexpected response (%d).\n", rh.command);
             }
+        } else if (strcmp(command, "CHECKPOINT") == 0) {
+            char* fname = strtok(NULL, " "); char* tag = strtok(NULL, " ");
+            if (!fname || !tag) { printf("[Client] Usage: CHECKPOINT <filename> <tag>\n"); continue; }
+            MsgCheckpointCreate rq = {0}; strncpy(rq.filename, fname, MAX_FILENAME_LEN-1); strncpy(rq.tag, tag, sizeof(rq.tag)-1); strncpy(rq.requester, username, MAX_USERNAME_LEN-1);
+            MsgHeader h = { .command = CMD_CHECKPOINT_CREATE, .payload_size = sizeof(rq) };
+            if (!send_all(nm_socket,&h,sizeof(h)) || !send_all(nm_socket,&rq,sizeof(rq))) { LOGE_CLIENT("Failed to send CHECKPOINT.\n"); continue; }
+            MsgHeader rh; if (!recv_all(nm_socket,&rh,sizeof(rh))) { LOGE_CLIENT("NM disconnected.\n"); break; }
+            if (rh.command == CMD_ACK) { printf("[Client] Checkpoint '%s' created for '%s'.\n", tag, fname); }
+            else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(nm_socket,&err,sizeof(err)); printf("[Client] CHECKPOINT failed (%d): %s\n", err.code, err.message); }
+            else { size_t rem=rh.payload_size; char drain[256]; while(rem>0){ size_t ch=rem>sizeof(drain)?sizeof(drain):rem; if(!recv_all(nm_socket,drain,ch)) break; rem -= ch; } printf("[Client] Unexpected response (%d).\n", rh.command); }
+        } else if (strcmp(command, "LISTCHECKPOINTS") == 0) {
+            char* fname = strtok(NULL, " "); if(!fname){ printf("[Client] Usage: LISTCHECKPOINTS <filename>\n"); continue; }
+            MsgCheckpointList rq = {0}; strncpy(rq.filename, fname, MAX_FILENAME_LEN-1); strncpy(rq.requester, username, MAX_USERNAME_LEN-1);
+            MsgHeader h = { .command = CMD_CHECKPOINT_LIST, .payload_size = sizeof(rq) };
+            if(!send_all(nm_socket,&h,sizeof(h)) || !send_all(nm_socket,&rq,sizeof(rq))){ LOGE_CLIENT("Failed to send LISTCHECKPOINTS.\n"); continue; }
+            MsgHeader rh; if(!recv_all(nm_socket,&rh,sizeof(rh))){ LOGE_CLIENT("NM disconnected.\n"); break; }
+            if(rh.command == CMD_CHECKPOINT_LIST_RESP && rh.payload_size == sizeof(MsgCheckpointListResponse)){
+                MsgCheckpointListResponse resp={0}; if(!recv_all(nm_socket,&resp,sizeof(resp))){ LOGE_CLIENT("Failed to read LISTCHECKPOINTS payload.\n"); break; }
+                if(resp.tags[0]=='\0') printf("[Client] No checkpoints.\n"); else printf("%s", resp.tags);
+            } else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(nm_socket,&err,sizeof(err)); printf("[Client] LISTCHECKPOINTS failed (%d): %s\n", err.code, err.message); }
+            else { size_t rem=rh.payload_size; char drain[256]; while(rem>0){ size_t ch=rem>sizeof(drain)?sizeof(drain):rem; if(!recv_all(nm_socket,drain,ch)) break; rem -= ch; } printf("[Client] Unexpected response (%d).\n", rh.command); }
+        } else if (strcmp(command, "VIEWCHECKPOINT") == 0) {
+            char* fname = strtok(NULL, " "); char* tag = strtok(NULL, " ");
+            if(!fname || !tag){ printf("[Client] Usage: VIEWCHECKPOINT <filename> <tag>\n"); continue; }
+            MsgCheckpointView rq = {0}; strncpy(rq.filename, fname, MAX_FILENAME_LEN-1); strncpy(rq.tag, tag, sizeof(rq.tag)-1); strncpy(rq.requester, username, MAX_USERNAME_LEN-1);
+            MsgHeader h = { .command = CMD_CHECKPOINT_VIEW, .payload_size = sizeof(rq) };
+            if(!send_all(nm_socket,&h,sizeof(h)) || !send_all(nm_socket,&rq,sizeof(rq))){ LOGE_CLIENT("Failed to send VIEWCHECKPOINT.\n"); continue; }
+            MsgHeader rh; if(!recv_all(nm_socket,&rh,sizeof(rh))){ LOGE_CLIENT("NM disconnected.\n"); break; }
+            if(rh.command == CMD_ACK && rh.payload_size >= 0){ int n=rh.payload_size; if(n>0){ char* buf=malloc((size_t)n+1); if(!buf){ LOGE_CLIENT("OOM.\n"); continue; } if(!recv_all(nm_socket,buf,(size_t)n)){ LOGE_CLIENT("Failed reading checkpoint content.\n"); free(buf); continue; } buf[n]='\0'; fwrite(buf,1,(size_t)n,stdout); if(n>0 && buf[n-1] != '\n') putchar('\n'); free(buf);} else { /* empty snapshot */ printf("\n"); } }
+            else if(rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(nm_socket,&err,sizeof(err)); printf("[Client] VIEWCHECKPOINT failed (%d): %s\n", err.code, err.message); }
+            else { size_t rem=rh.payload_size; char drain[256]; while(rem>0){ size_t ch=rem>sizeof(drain)?sizeof(drain):rem; if(!recv_all(nm_socket,drain,ch)) break; rem -= ch; } printf("[Client] Unexpected response (%d).\n", rh.command); }
+        } else if (strcmp(command, "REVERT") == 0) {
+            char* fname = strtok(NULL, " "); char* tag = strtok(NULL, " ");
+            if(!fname || !tag){ printf("[Client] Usage: REVERT <filename> <tag>\n"); continue; }
+            MsgCheckpointRevert rq = {0}; strncpy(rq.filename, fname, MAX_FILENAME_LEN-1); strncpy(rq.tag, tag, sizeof(rq.tag)-1); strncpy(rq.requester, username, MAX_USERNAME_LEN-1);
+            MsgHeader h = { .command = CMD_CHECKPOINT_REVERT, .payload_size = sizeof(rq) };
+            if(!send_all(nm_socket,&h,sizeof(h)) || !send_all(nm_socket,&rq,sizeof(rq))){ LOGE_CLIENT("Failed to send REVERT.\n"); continue; }
+            MsgHeader rh; if(!recv_all(nm_socket,&rh,sizeof(rh))){ LOGE_CLIENT("NM disconnected.\n"); break; }
+            if(rh.command == CMD_ACK){ printf("[Client] Reverted '%s' to checkpoint '%s'.\n", fname, tag); }
+            else if(rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(nm_socket,&err,sizeof(err)); printf("[Client] REVERT failed (%d): %s\n", err.code, err.message); }
+            else { size_t rem=rh.payload_size; char drain[256]; while(rem>0){ size_t ch=rem>sizeof(drain)?sizeof(drain):rem; if(!recv_all(nm_socket,drain,ch)) break; rem -= ch; } printf("[Client] Unexpected response (%d).\n", rh.command); }
         } else if (strcmp(command, "UNDO") == 0) {
             char* fname = strtok(NULL, " ");
             if (!fname) { printf("[Client] Usage: UNDO <filename>\n"); continue; }
@@ -808,6 +937,7 @@ write_cancel_release:
             char hold[5]; int hlen = 0; // keep last up to 5 bytes to match STOP\n
             // Unbuffer stdout to see live output
             setvbuf(stdout, NULL, _IONBF, 0);
+            char last_printed = '\n'; // track last printed char to decide whether to add a trailing newline
 
             char rbuf[1024];
             while (!got_stop) {
@@ -820,6 +950,7 @@ write_cancel_release:
                     } else {
                         // print the oldest byte and shift
                         fputc(hold[0], stdout);
+                        last_printed = hold[0];
                         memmove(hold, hold+1, 4);
                         hold[4] = ch;
                     }
@@ -831,8 +962,16 @@ write_cancel_release:
             }
             if (!got_stop) {
                 // flush any pending bytes
-                for (int i = 0; i < hlen; ++i) fputc(hold[i], stdout);
+                for (int i = 0; i < hlen; ++i) { fputc(hold[i], stdout); last_printed = hold[i]; }
                 printf("\nError: Storage Server disconnected during streaming\n");
+            } else {
+                // Stream ended with STOP sentinel. Ensure the prompt starts on a new line.
+                if (last_printed != '\n') fputc('\n', stdout);
+            }
+            // Restore stdout buffering to a sane default for the interactive prompt
+            {
+                int tty = isatty(fileno(stdout));
+                setvbuf(stdout, NULL, tty ? _IOLBF : _IOFBF, 0);
             }
             close(ss_fd);
         } else if (strcmp(command, "LIST") == 0) {
@@ -883,6 +1022,65 @@ write_cancel_release:
                 size_t rem = rh.payload_size; char drain[256]; while (rem > 0) { size_t ch = rem>sizeof(drain)?sizeof(drain):rem; if (!recv_all(nm_socket, drain, ch)) break; rem -= ch; }
                 printf("[Client] Unexpected response to EXEC (%d).\n", rh.command);
             }
+        } else if (strcmp(command, "REQUESTACCESS") == 0) {
+            // REQUESTACCESS -R|-W <filename>
+            char* flag = strtok(NULL, " ");
+            char* fname = strtok(NULL, " ");
+            if (!flag || !fname || !(strcasecmp(flag, "-R")==0 || strcasecmp(flag, "-W")==0)) {
+                printf("[Client] Usage: REQUESTACCESS -R|-W <filename>\n");
+                continue;
+            }
+            int want_write = (strcasecmp(flag, "-W") == 0);
+            MsgAccessRequestCreate rq = (MsgAccessRequestCreate){0};
+            strncpy(rq.filename, fname, MAX_FILENAME_LEN-1);
+            rq.want_write = want_write;
+            strncpy(rq.requester, username, MAX_USERNAME_LEN-1);
+            MsgHeader h = { .command = CMD_REQUEST_ACCESS, .payload_size = sizeof(rq) };
+            if (!send_all(nm_socket,&h,sizeof(h)) || !send_all(nm_socket,&rq,sizeof(rq))) { LOGE_CLIENT("Failed to send REQUESTACCESS.\n"); continue; }
+            MsgHeader rh; if(!recv_all(nm_socket,&rh,sizeof(rh))) { LOGE_CLIENT("NM disconnected.\n"); break; }
+            if (rh.command == CMD_ACK) printf("[Client] Access request submitted.\n");
+            else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(nm_socket,&err,sizeof(err)); printf("[Client] REQUESTACCESS failed (%d): %s\n", err.code, err.message); }
+            else { // drain
+                size_t rem = rh.payload_size; char drain[256]; while(rem>0){ size_t ch = rem>sizeof(drain)?sizeof(drain):rem; if(!recv_all(nm_socket,drain,ch)) break; rem -= ch; }
+                printf("[Client] Unexpected response (%d).\n", rh.command);
+            }
+        } else if (strcmp(command, "LISTREQUESTS") == 0) {
+            // LISTREQUESTS <filename>
+            char* fname = strtok(NULL, " "); if(!fname){ printf("[Client] Usage: LISTREQUESTS <filename>\n"); continue; }
+            MsgAccessRequestList rq = (MsgAccessRequestList){0};
+            strncpy(rq.filename, fname, MAX_FILENAME_LEN-1); strncpy(rq.requester, username, MAX_USERNAME_LEN-1);
+            MsgHeader h = { .command = CMD_LIST_REQUESTS, .payload_size = sizeof(rq) };
+            if(!send_all(nm_socket,&h,sizeof(h)) || !send_all(nm_socket,&rq,sizeof(rq))){ LOGE_CLIENT("Failed to send LISTREQUESTS.\n"); continue; }
+            MsgHeader rh; if(!recv_all(nm_socket,&rh,sizeof(rh))){ LOGE_CLIENT("NM disconnected.\n"); break; }
+            if(rh.command == CMD_LIST_REQUESTS_RESP && rh.payload_size == sizeof(MsgAccessRequestListResp)){
+                MsgAccessRequestListResp resp={0}; if(!recv_all(nm_socket,&resp,sizeof(resp))){ LOGE_CLIENT("Failed reading LISTREQUESTS payload.\n"); break; }
+                if(resp.requests[0]=='\0') printf("[Client] No pending requests.\n"); else printf("%s", resp.requests);
+            } else if(rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(nm_socket,&err,sizeof(err)); printf("[Client] LISTREQUESTS failed (%d): %s\n", err.code, err.message); }
+            else { size_t rem = rh.payload_size; char drain[256]; while(rem>0){ size_t ch = rem>sizeof(drain)?sizeof(drain):rem; if(!recv_all(nm_socket,drain,ch)) break; rem -= ch; } printf("[Client] Unexpected response (%d).\n", rh.command); }
+        } else if (strcmp(command, "APPROVEREQUEST") == 0 || strcmp(command, "DENYREQUEST") == 0) {
+            int approving = (strcmp(command, "APPROVEREQUEST") == 0);
+            // APPROVEREQUEST -R|-W <filename> <username>
+            // DENYREQUEST <filename> <username>
+            char* flag = NULL; char* fname = NULL; char* target = NULL; int grant_write = 0; int parse_ok = 0;
+            if (approving) {
+                flag = strtok(NULL, " "); fname = strtok(NULL, " "); target = strtok(NULL, " ");
+                if(flag && fname && target && (strcasecmp(flag,"-R")==0 || strcasecmp(flag,"-W")==0)) { grant_write = (strcasecmp(flag,"-W")==0); parse_ok = 1; }
+            } else {
+                fname = strtok(NULL, " "); target = strtok(NULL, " "); if(fname && target){ parse_ok = 1; }
+            }
+            if(!parse_ok){
+                if(approving) printf("[Client] Usage: APPROVEREQUEST -R|-W <filename> <username>\n"); else printf("[Client] Usage: DENYREQUEST <filename> <username>\n");
+                continue;
+            }
+            MsgAccessRequestRespond rq = (MsgAccessRequestRespond){0};
+            strncpy(rq.filename,fname,MAX_FILENAME_LEN-1); strncpy(rq.target,target,MAX_USERNAME_LEN-1);
+            rq.approve = approving ? 1 : 0; rq.grant_write = approving ? grant_write : 0; strncpy(rq.requester, username, MAX_USERNAME_LEN-1);
+            MsgHeader h = { .command = CMD_RESPOND_REQUEST, .payload_size = sizeof(rq) };
+            if(!send_all(nm_socket,&h,sizeof(h)) || !send_all(nm_socket,&rq,sizeof(rq))){ LOGE_CLIENT("Failed to send RESPONDREQUEST.\n"); continue; }
+            MsgHeader rh; if(!recv_all(nm_socket,&rh,sizeof(rh))){ LOGE_CLIENT("NM disconnected.\n"); break; }
+            if(rh.command == CMD_ACK){ if(approving) printf("[Client] Request approved.\n"); else printf("[Client] Request denied.\n"); }
+            else if(rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(nm_socket,&err,sizeof(err)); printf("[Client] %s failed (%d): %s\n", approving?"APPROVEREQUEST":"DENYREQUEST", err.code, err.message); }
+            else { size_t rem=rh.payload_size; char drain[256]; while(rem>0){ size_t ch=rem>sizeof(drain)?sizeof(drain):rem; if(!recv_all(nm_socket,drain,ch)) break; rem -= ch; } printf("[Client] Unexpected response (%d).\n", rh.command); }
         } else {
             printf("[Client] Unknown command: %s\n", command);
         }
