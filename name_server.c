@@ -409,7 +409,7 @@ void* handle_connection(void* arg) {
     }
 
     while (recv_all(socket, &header, sizeof(MsgHeader))) {
-        LOG_NM("Received command %d from socket %d (Slot %d)\n", header.command, socket, slot);
+        LOG_NM("Received command %d from socket %d (Slot %d, type=%d user='%s' ip=%s)\n", header.command, socket, slot, connections[slot].type, connections[slot].username, connections[slot].ip_addr);
 
         // Handle selected commands here
         if (header.command == CMD_CREATE_FILE && connections[slot].type == CONN_TYPE_CLIENT) {
@@ -422,6 +422,7 @@ void* handle_connection(void* arg) {
                 send_error(socket, 400, "Failed to read payload");
                 continue;
             }
+            LOG_NM("CREATE request filename='%s' owner='%s' from user='%s' ip=%s slot=%d\n", payload.filename, payload.owner, connections[slot].username, connections[slot].ip_addr, slot);
 
             int ss_slot = choose_ss_slot();
             if (ss_slot < 0) {
@@ -457,6 +458,7 @@ void* handle_connection(void* arg) {
                     send_error(socket, 502, "No response from Storage Server");
                     continue;
                 }
+                LOG_NM("CREATE SS response cmd=%d payload=%d (file='%s')\n", ss_resp.command, ss_resp.payload_size, payload.filename);
                 // If SS acknowledged creation, update NM registry before proxying
                 if (ss_resp.command == CMD_ACK) {
                     registry_add_file_if_absent(payload.filename, payload.owner, ss_slot);
@@ -501,6 +503,7 @@ void* handle_connection(void* arg) {
             }
             MsgViewFilesRequest vreq = {0};
             if (!recv_all(socket, &vreq, sizeof(vreq))) { send_error(socket, 400, "Payload read failed"); continue; }
+            LOG_NM("VIEW request from user='%s' ip=%s flags: show_all=%d long_list=%d\n", connections[slot].username, connections[slot].ip_addr, vreq.show_all, vreq.long_list);
 
             if (vreq.show_all) {
                 int fc = 0;
@@ -519,6 +522,30 @@ void* handle_connection(void* arg) {
             strncpy(requester, connections[slot].username, MAX_USERNAME_LEN-1);
 
             char buffer[16384]; buffer[0] = '\0'; size_t pos = 0, cap = sizeof(buffer);
+
+            // Ensure ACL metadata is available before filtering for default VIEW (no -l, no -a)
+            if (!vreq.show_all && !vreq.long_list) {
+                typedef struct { char name[MAX_FILENAME_LEN]; int ss_slot; } FSel;
+                FSel tmp[1024]; int n_tmp = 0;
+                pthread_mutex_lock(&file_registry_mutex);
+                for (int i = 0; i < file_count && n_tmp < (int)(sizeof(tmp)/sizeof(tmp[0])); i++) {
+                    const char* fname = file_registry[i].filename;
+                    int ss_slot = file_registry[i].ss_slot;
+                    int need = 0;
+                    if (file_registry[i].owner[0] == '\0' || (file_registry[i].readers[0] == '\0' && file_registry[i].writers[0] == '\0')) {
+                        need = 1;
+                    }
+                    if (need) {
+                        strncpy(tmp[n_tmp].name, fname, MAX_FILENAME_LEN-1); tmp[n_tmp].name[MAX_FILENAME_LEN-1] = '\0';
+                        tmp[n_tmp].ss_slot = ss_slot;
+                        n_tmp++;
+                    }
+                }
+                pthread_mutex_unlock(&file_registry_mutex);
+                for (int i = 0; i < n_tmp; i++) {
+                    registry_update_one_from_ss(tmp[i].ss_slot, tmp[i].name);
+                }
+            }
 
             // If long_list is requested, gather targets and refresh INFO per file for dynamic stats
             if (vreq.long_list) {
@@ -598,6 +625,7 @@ void* handle_connection(void* arg) {
             MsgViewFilesResponse resp = {0};
             strncpy(resp.file_list, buffer, sizeof(resp.file_list)-1);
             MsgHeader h = { .command = CMD_VIEW_FILES_RESP, .payload_size = sizeof(resp) };
+            LOG_NM("VIEW response bytes=%zu to user='%s'\n", sizeof(resp), connections[slot].username);
             send_all(socket, &h, sizeof(h));
             send_all(socket, &resp, sizeof(resp));
             continue;
@@ -614,6 +642,7 @@ void* handle_connection(void* arg) {
                 send_error(socket, 400, "Payload read failed");
                 continue;
             }
+            LOG_NM("READ routing request filename='%s' requester='%s' from ip=%s\n", req.filename, req.requester, connections[slot].ip_addr);
 
             // Try cache-first; refresh only on miss
 
@@ -654,6 +683,7 @@ void* handle_connection(void* arg) {
             MsgHeader h = {0};
             h.command = CMD_READ_FILE_RESP;
             h.payload_size = sizeof(resp);
+            LOG_NM("READ routing response filename='%s' found=%d ss=%s:%d to user='%s'\n", req.filename, resp.found, resp.ss_ip, resp.ss_port, connections[slot].username);
             send_all(socket, &h, sizeof(h));
             send_all(socket, &resp, sizeof(resp));
             continue;
@@ -670,6 +700,7 @@ void* handle_connection(void* arg) {
                 send_error(socket, 400, "Payload read failed");
                 continue;
             }
+            LOG_NM("%s request file='%s' target='%s' by user='%s'\n", (header.command==CMD_ADD_ACCESS?"ADD_ACCESS":"REM_ACCESS"), req.filename, req.target, connections[slot].username);
             // Find owning SS (cache-first; refresh on miss)
             int ss_slot = -1;
             int idx_acc = file_index_find(req.filename);
@@ -712,6 +743,7 @@ void* handle_connection(void* arg) {
                     send_error(socket, 502, "No response from Storage Server");
                     continue;
                 }
+                LOG_NM("Proxied %s response cmd=%d payload=%d for file='%s' to user='%s'\n", (header.command==CMD_ADD_ACCESS?"ADD_ACCESS":"REM_ACCESS"), rs.command, rs.payload_size, req.filename, connections[slot].username);
                 if (!send_all(socket, &rs, sizeof(rs))) {
                     pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
                     continue;
@@ -744,6 +776,7 @@ void* handle_connection(void* arg) {
                 send_error(socket, 400, "Payload read failed");
                 continue;
             }
+            LOG_NM("INFO request filename='%s' from user='%s' ip=%s\n", req.filename, connections[slot].username, connections[slot].ip_addr);
 
             // Authenticated requester
             char requester[MAX_USERNAME_LEN] = {0};
@@ -819,7 +852,8 @@ void* handle_connection(void* arg) {
             }
             pthread_mutex_unlock(&file_registry_mutex);
 
-            MsgHeader h = { .command = CMD_INFO_RESP, .payload_size = sizeof(resp) };
+        MsgHeader h = { .command = CMD_INFO_RESP, .payload_size = sizeof(resp) };
+        LOG_NM("INFO response for '%s' bytes=%zu to user='%s'\n", req.filename, sizeof(resp), connections[slot].username);
             send_all(socket, &h, sizeof(h));
             send_all(socket, &resp, sizeof(resp));
             continue;
@@ -833,6 +867,7 @@ void* handle_connection(void* arg) {
             }
             MsgUndoRequest req;
             if (!recv_all(socket, &req, sizeof(req))) { send_error(socket, 400, "Payload read failed"); continue; }
+            LOG_NM("UNDO request filename='%s' by user='%s' ip=%s\n", req.filename, connections[slot].username, connections[slot].ip_addr);
             // Overwrite requester with authenticated username
             strncpy(req.requester, connections[slot].username, MAX_USERNAME_LEN-1);
             req.requester[MAX_USERNAME_LEN-1] = '\0';
@@ -870,6 +905,7 @@ void* handle_connection(void* arg) {
                     send_error(socket, 502, "No response from Storage Server");
                     continue;
                 }
+                LOG_NM("Proxied UNDO response cmd=%d payload=%d for '%s'\n", rs.command, rs.payload_size, req.filename);
                 if (!send_all(socket, &rs, sizeof(rs))) {
                     pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
                     continue;
@@ -907,6 +943,7 @@ void* handle_connection(void* arg) {
             else { strncpy(te.owner, auth_user, MAX_USERNAME_LEN-1); }
 
             if (header.command == CMD_TRASH_LIST) {
+                LOG_NM("TRASH LIST request by user='%s'\n", auth_user);
                 // Query all SS and aggregate lists
                 MsgTrashListResp agg = {0}; size_t pos = 0, cap = sizeof(agg.files);
                 pthread_mutex_lock(&connections_mutex);
@@ -939,6 +976,7 @@ void* handle_connection(void* arg) {
                 }
                 pthread_mutex_unlock(&connections_mutex);
                 MsgHeader h = { .command = CMD_TRASH_LIST_RESP, .payload_size = sizeof(agg) };
+                LOG_NM("TRASH LIST RESP bytes=%zu to user='%s'\n", sizeof(agg), connections[slot].username);
                 send_all(socket, &h, sizeof(h));
                 send_all(socket, &agg, sizeof(agg));
                 continue;
@@ -969,11 +1007,12 @@ void* handle_connection(void* arg) {
                     pthread_mutex_lock(&connections_mutex);
                 }
                 pthread_mutex_unlock(&connections_mutex);
-                if (!recovered) { send_error(socket, 404, "Not found in trash"); continue; }
+                if (!recovered) { LOGE_NM("TRASH RECOVER not found owner='%s' file='%s'\n", tr.owner, tr.filename); send_error(socket, 404, "Not found in trash"); continue; }
                 // Update registry: add mapping and refresh INFO
                 const char* newname = (tr.newname[0] ? tr.newname : tr.filename);
                 registry_add_file_if_absent(newname, tr.owner, recovered_ss);
                 registry_update_one_from_ss(recovered_ss, newname);
+                LOG_NM("TRASH RECOVER ACK '%s' as '%s' owner='%s'\n", tr.filename, newname, tr.owner);
                 send_ack(socket);
                 continue;
             }
@@ -1001,9 +1040,9 @@ void* handle_connection(void* arg) {
                         pthread_mutex_lock(&connections_mutex);
                     }
                     pthread_mutex_unlock(&connections_mutex);
-                    if (!any_acted) { send_error(socket, 404, "Nothing to remove"); continue; }
+                    if (!any_acted) { LOGE_NM("EMPTYTRASH all: nothing to remove for user '%s'\n", connections[slot].username); send_error(socket, 404, "Nothing to remove"); continue; }
                     if (!ok_all) { send_error(socket, 500, "Some items could not be removed"); continue; }
-                    send_ack(socket); continue;
+                    LOG_NM("EMPTYTRASH all ACK for user '%s'\n", connections[slot].username); send_ack(socket); continue;
                 } else {
                     // Remove a specific file from trash: try all SS until one ACKs
                     pthread_mutex_lock(&connections_mutex);
@@ -1024,8 +1063,8 @@ void* handle_connection(void* arg) {
                         pthread_mutex_lock(&connections_mutex);
                     }
                     pthread_mutex_unlock(&connections_mutex);
-                    if (!any_acted) { send_error(socket, 404, "Not found in trash"); continue; }
-                    send_ack(socket); continue;
+                    if (!any_acted) { LOGE_NM("EMPTYTRASH single not found owner='%s' file='%s'\n", te.owner, te.filename); send_error(socket, 404, "Not found in trash"); continue; }
+                    LOG_NM("EMPTYTRASH ACK owner='%s' file='%s'\n", te.owner, te.filename); send_ack(socket); continue;
                 }
             }
         } else if ((header.command == CMD_CHECKPOINT_CREATE || header.command == CMD_CHECKPOINT_VIEW || header.command == CMD_CHECKPOINT_REVERT || header.command == CMD_CHECKPOINT_LIST) && connections[slot].type == CONN_TYPE_CLIENT) {
@@ -1043,10 +1082,10 @@ void* handle_connection(void* arg) {
             // Read payload
             MsgCheckpointCreate ccreate; MsgCheckpointView cview; MsgCheckpointRevert crevert; MsgCheckpointList clist;
             const char* fname = NULL;
-            if (header.command == CMD_CHECKPOINT_CREATE) { if (!recv_all(socket, &ccreate, sizeof(ccreate))) { send_error(socket, 400, "Payload read failed"); continue; } fname = ccreate.filename; }
-            else if (header.command == CMD_CHECKPOINT_VIEW) { if (!recv_all(socket, &cview, sizeof(cview))) { send_error(socket, 400, "Payload read failed"); continue; } fname = cview.filename; }
-            else if (header.command == CMD_CHECKPOINT_REVERT) { if (!recv_all(socket, &crevert, sizeof(crevert))) { send_error(socket, 400, "Payload read failed"); continue; } fname = crevert.filename; }
-            else { if (!recv_all(socket, &clist, sizeof(clist))) { send_error(socket, 400, "Payload read failed"); continue; } fname = clist.filename; }
+            if (header.command == CMD_CHECKPOINT_CREATE) { if (!recv_all(socket, &ccreate, sizeof(ccreate))) { send_error(socket, 400, "Payload read failed"); continue; } fname = ccreate.filename; LOG_NM("CHECKPOINT CREATE file='%s' tag='%s' by '%s'\n", ccreate.filename, ccreate.tag, connections[slot].username); }
+            else if (header.command == CMD_CHECKPOINT_VIEW) { if (!recv_all(socket, &cview, sizeof(cview))) { send_error(socket, 400, "Payload read failed"); continue; } fname = cview.filename; LOG_NM("CHECKPOINT VIEW file='%s' tag='%s' by '%s'\n", cview.filename, cview.tag, connections[slot].username); }
+            else if (header.command == CMD_CHECKPOINT_REVERT) { if (!recv_all(socket, &crevert, sizeof(crevert))) { send_error(socket, 400, "Payload read failed"); continue; } fname = crevert.filename; LOG_NM("CHECKPOINT REVERT file='%s' tag='%s' by '%s'\n", crevert.filename, crevert.tag, connections[slot].username); }
+            else { if (!recv_all(socket, &clist, sizeof(clist))) { send_error(socket, 400, "Payload read failed"); continue; } fname = clist.filename; LOG_NM("CHECKPOINT LIST file='%s' by '%s'\n", clist.filename, connections[slot].username); }
 
             // Resolve owning SS (cache-first; refresh on miss)
             int ss_slot = -1;
@@ -1099,6 +1138,7 @@ void* handle_connection(void* arg) {
                     send_error(socket, 502, "No response from Storage Server");
                     continue;
                 }
+                LOG_NM("Proxied CHECKPOINT cmd=%d payload=%d for file='%s'\n", rs.command, rs.payload_size, fname);
                 if (!send_all(socket, &rs, sizeof(rs))) { pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex); continue; }
                 size_t rem = rs.payload_size; char buf[4096];
                 while (rem > 0) {
@@ -1127,9 +1167,9 @@ void* handle_connection(void* arg) {
             // Read payloads
             MsgAccessRequestCreate creq; MsgAccessRequestList lreq; MsgAccessRequestRespond rreq;
             const char* fname = NULL;
-            if (header.command == CMD_REQUEST_ACCESS) { if (!recv_all(socket, &creq, sizeof(creq))) { send_error(socket, 400, "Payload read failed"); continue; } fname = creq.filename; }
-            else if (header.command == CMD_LIST_REQUESTS) { if (!recv_all(socket, &lreq, sizeof(lreq))) { send_error(socket, 400, "Payload read failed"); continue; } fname = lreq.filename; }
-            else { if (!recv_all(socket, &rreq, sizeof(rreq))) { send_error(socket, 400, "Payload read failed"); continue; } fname = rreq.filename; }
+            if (header.command == CMD_REQUEST_ACCESS) { if (!recv_all(socket, &creq, sizeof(creq))) { send_error(socket, 400, "Payload read failed"); continue; } fname = creq.filename; LOG_NM("REQUEST_ACCESS file='%s' want_write=%d by '%s'\n", creq.filename, creq.want_write, connections[slot].username); }
+            else if (header.command == CMD_LIST_REQUESTS) { if (!recv_all(socket, &lreq, sizeof(lreq))) { send_error(socket, 400, "Payload read failed"); continue; } fname = lreq.filename; LOG_NM("LIST_REQUESTS file='%s' by '%s'\n", lreq.filename, connections[slot].username); }
+            else { if (!recv_all(socket, &rreq, sizeof(rreq))) { send_error(socket, 400, "Payload read failed"); continue; } fname = rreq.filename; LOG_NM("RESPOND_REQUEST file='%s' target='%s' approve=%d write=%d by '%s'\n", rreq.filename, rreq.target, rreq.approve, rreq.grant_write, connections[slot].username); }
 
             // Resolve owning SS (cache-first; refresh on miss)
             int ss_slot = -1;
@@ -1172,6 +1212,7 @@ void* handle_connection(void* arg) {
                 }
 
                 if (!recv_all(ss_sock_local, &rs, sizeof(rs))) { pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex); send_error(socket, 502, "No response from Storage Server"); continue; }
+                LOG_NM("Proxied %s response cmd=%d payload=%d file='%s'\n", (header.command==CMD_REQUEST_ACCESS?"REQUEST_ACCESS":(header.command==CMD_LIST_REQUESTS?"LIST_REQUESTS":"RESPOND_REQUEST")), rs.command, rs.payload_size, fname);
                 if (!send_all(socket, &rs, sizeof(rs))) { pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex); continue; }
                 size_t rem = rs.payload_size; char buf[4096];
                 while (rem > 0) { size_t ch = rem > sizeof(buf) ? sizeof(buf) : rem; if (!recv_all(ss_sock_local, buf, ch)) break; if (!send_all(socket, buf, ch)) break; rem -= ch; }
@@ -1207,6 +1248,7 @@ void* handle_connection(void* arg) {
             pthread_mutex_unlock(&connections_mutex);
 
             MsgHeader h = { .command = CMD_LIST_USERS_RESP, .payload_size = sizeof(resp) };
+            LOG_NM("LIST users count response bytes=%zu to user='%s'\n", sizeof(resp), connections[slot].username);
             send_all(socket, &h, sizeof(h));
             send_all(socket, &resp, sizeof(resp));
             continue;
@@ -1220,6 +1262,7 @@ void* handle_connection(void* arg) {
             }
             MsgExecRequest rq;
             if (!recv_all(socket, &rq, sizeof(rq))) { send_error(socket, 400, "Payload read failed"); continue; }
+            LOG_NM("EXEC request filename='%s' from user='%s'\n", rq.filename, connections[slot].username);
             // Overwrite requester with authenticated username
             strncpy(rq.requester, connections[slot].username, MAX_USERNAME_LEN-1);
             rq.requester[MAX_USERNAME_LEN-1] = '\0';
@@ -1239,25 +1282,39 @@ void* handle_connection(void* arg) {
             }
             if (ss_slot < 0) { send_error(socket, 404, "File not found"); continue; }
 
-            // Contact SS's client port to fetch file content using header-based READ (SS enforces ACL)
-            char ss_ip[MAX_IP_LEN] = {0};
-            int ss_port = 0;
-            pthread_mutex_lock(&connections_mutex);
-            strncpy(ss_ip, connections[ss_slot].ip_addr, sizeof(ss_ip)-1);
-            ss_port = connections[ss_slot].client_port;
-            pthread_mutex_unlock(&connections_mutex);
-
-            char* file_data = NULL; int file_size = 0;
-            int ff_rc = nm_fetch_file_from_ss(ss_ip, ss_port, rq.filename, rq.requester, &file_data, &file_size);
-            if (ff_rc != 0) {
-                if (ff_rc <= -1000) { // encoded SS error
-                    int code = -1000 - ff_rc; send_error(socket, code ? code : 502, "READ denied or failed");
-                } else {
-                    send_error(socket, 502, "Failed to fetch file from SS");
+            // Fetch file content over NM↔SS channel (serialized) using CMD_READ_FILE
+            char* file_data = NULL; int file_size = 0; int fetch_err = 0;
+            pthread_mutex_lock(&connections[ss_slot].ss_io_mutex);
+            do {
+                int ss_sock_local;
+                pthread_mutex_lock(&connections_mutex);
+                ss_sock_local = connections[ss_slot].socket;
+                pthread_mutex_unlock(&connections_mutex);
+                MsgHeader fwd = { .command = CMD_READ_FILE, .payload_size = sizeof(MsgReadFile) };
+                MsgReadFile rf = {0}; strncpy(rf.filename, rq.filename, MAX_FILENAME_LEN-1); strncpy(rf.requester, rq.requester, MAX_USERNAME_LEN-1);
+                if (!send_all(ss_sock_local, &fwd, sizeof(fwd)) || !send_all(ss_sock_local, &rf, sizeof(rf))) { fetch_err = 502; break; }
+                MsgHeader rs; if (!recv_all(ss_sock_local, &rs, sizeof(rs))) { fetch_err = 502; break; }
+                if (rs.command == CMD_ERROR && rs.payload_size == sizeof(MsgError)) {
+                    MsgError e; if (!recv_all(ss_sock_local, &e, sizeof(e))) { fetch_err = 502; } else { fetch_err = e.code ? e.code : 502; }
+                    break;
                 }
-                if (file_data) free(file_data);
-                continue;
-            }
+                if (rs.command != CMD_ACK || rs.payload_size < 0) {
+                    // drain any payload
+                    size_t rem = rs.payload_size; char drain[512]; while (rem > 0) { size_t ch = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(ss_sock_local, drain, ch)) break; rem -= ch; }
+                    fetch_err = 502; break;
+                }
+                int n = rs.payload_size;
+                file_data = (char*)malloc((size_t)n + 1);
+                if (!file_data) { // drain
+                    size_t rem = n; char drain[512]; while (rem > 0) { size_t ch = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(ss_sock_local, drain, ch)) break; rem -= ch; }
+                    fetch_err = 500; break;
+                }
+                if (n > 0 && !recv_all(ss_sock_local, file_data, (size_t)n)) { free(file_data); file_data = NULL; fetch_err = 502; break; }
+                file_data[n] = '\0'; file_size = n;
+            } while (0);
+            pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+            if (fetch_err) { if (file_data) free(file_data); send_error(socket, fetch_err, "READ denied or failed"); continue; }
+            LOG_NM("EXEC fetched file '%s' size=%d via NM-SS channel (slot %d)\n", rq.filename, file_size, ss_slot);
 
             // Execute on Name Server host using /bin/sh -s < tmpfile, capturing stdout+stderr
             char tmpl[] = "/tmp/nm_exec_XXXXXX";
@@ -1295,10 +1352,12 @@ void* handle_connection(void* arg) {
             // Send output as ACK payload (if no output, send zero-length ACK)
             if (!out) {
                 MsgHeader ah0 = { .command = CMD_ACK, .payload_size = 0 };
+                LOG_NM("EXEC ACK no output for '%s' to user '%s'\n", rq.filename, connections[slot].username);
                 send_all(socket, &ah0, sizeof(ah0));
                 continue;
             }
             MsgHeader ah = { .command = CMD_ACK, .payload_size = (int)out_sz };
+            LOG_NM("EXEC ACK output bytes=%zu for '%s' to user '%s'\n", out_sz, rq.filename, connections[slot].username);
             if (!send_all(socket, &ah, sizeof(ah)) || (out_sz > 0 && !send_all(socket, out, out_sz))) {
                 // client disconnected; drop
             }
@@ -1316,6 +1375,7 @@ void* handle_connection(void* arg) {
                 send_error(socket, 400, "Failed to read payload");
                 continue;
             }
+            LOG_NM("DELETE request filename='%s' by user='%s' ip=%s\n", payload.filename, connections[slot].username, connections[slot].ip_addr);
 
             // Overwrite requester with authenticated username
             strncpy(payload.requester, connections[slot].username, MAX_USERNAME_LEN-1);
@@ -1365,6 +1425,7 @@ void* handle_connection(void* arg) {
                     send_error(socket, 502, "No response from Storage Server");
                     continue;
                 }
+                LOG_NM("DELETE SS response cmd=%d payload=%d for '%s'\n", ss_resp.command, ss_resp.payload_size, payload.filename);
                 // Send header to client now
                 if (!send_all(socket, &ss_resp, sizeof(ss_resp))) {
                     pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
@@ -1416,6 +1477,7 @@ void* handle_connection(void* arg) {
                 send_error(socket, 400, "Failed to read payload");
                 continue;
             }
+            LOG_NM("CLEAR request filename='%s' by user='%s'\n", payload.filename, connections[slot].username);
 
             // Overwrite requester with authenticated username
             strncpy(payload.requester, connections[slot].username, MAX_USERNAME_LEN-1);
@@ -1464,6 +1526,7 @@ void* handle_connection(void* arg) {
                     send_error(socket, 502, "No response from Storage Server");
                     continue;
                 }
+                LOG_NM("CLEAR SS response cmd=%d payload=%d for '%s'\n", ss_resp.command, ss_resp.payload_size, payload.filename);
                 // Relay header
                 if (!send_all(socket, &ss_resp, sizeof(ss_resp))) {
                     pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
@@ -1520,9 +1583,28 @@ void handle_register_ss(int slot, const MsgRegisterSS* msg) {
     LOG_NM("Storage Server registered from %s. Listening for clients on port %d. (Slot: %d)\n",
         connections[slot].ip_addr, msg->client_listen_port, slot);
 
+    // If SS supplied an initial file list, seed the registry now
+    if (msg->initial_files[0] != '\0') {
+        LOG_NM("Seeding registry from SS slot %d initial file list.\n", slot);
+        const char* p = msg->initial_files;
+        char line[MAX_FILENAME_LEN];
+        while (*p) {
+            size_t k = 0;
+            // read until newline or buffer full
+            while (*p && *p != '\n' && k + 1 < sizeof(line)) {
+                line[k++] = *p++;
+            }
+            if (*p == '\n') p++;
+            line[k] = '\0';
+            if (k > 0) {
+                registry_add_file_if_absent(line, "", slot);
+            }
+        }
+    }
+
     send_ack(connections[slot].socket);
 
-    // Populate/refresh registry mapping when a new SS registers (infrequent, acceptable cost)
+    // Still perform a full refresh to pick up metadata and any races
     registry_refresh_from_ss();
 }
 
@@ -1532,14 +1614,25 @@ void handle_register_ss(int slot, const MsgRegisterSS* msg) {
 void handle_register_client(int slot, const MsgRegisterClient* msg) {
     pthread_mutex_lock(&connections_mutex);
     connections[slot].type = CONN_TYPE_CLIENT;
+
     // Ensure username is null-terminated
     strncpy(connections[slot].username, msg->username, MAX_USERNAME_LEN - 1);
     connections[slot].username[MAX_USERNAME_LEN - 1] = '\0';
+
+    // If the client supplied an IP, prefer that over the socket-derived one
+    if (msg->client_ip[0] != '\0') {
+        strncpy(connections[slot].ip_addr, msg->client_ip, INET_ADDRSTRLEN - 1);
+        connections[slot].ip_addr[INET_ADDRSTRLEN - 1] = '\0';
+    }
     pthread_mutex_unlock(&connections_mutex);
 
-    LOG_NM("Client '%s' registered from %s. (Slot: %d)\n",
-        connections[slot].username, connections[slot].ip_addr, slot);
-           
+    LOG_NM("Client '%s' registered (ip=%s, nm_port=%d, ss_port=%d, slot=%d)\n",
+        connections[slot].username,
+        connections[slot].ip_addr,
+        msg->nm_port,
+        msg->ss_port,
+        slot);
+
     send_ack(connections[slot].socket);
 }
 
@@ -1551,6 +1644,7 @@ void send_ack(int socket) {
     ack_header.command = CMD_ACK;
     ack_header.payload_size = 0;
     
+    LOG_NM("Sending ACK to socket %d\n", socket);
     if (!send_all(socket, &ack_header, sizeof(MsgHeader))) {
         LOGE_NM("Failed to send ACK to socket %d\n", socket);
     }
@@ -1577,6 +1671,7 @@ static void send_error(int socket, int code, const char* msg) {
     h.payload_size = sizeof(MsgError);
     e.code = code;
     strncpy(e.message, msg ? msg : "error", sizeof(e.message)-1);
+    LOGE_NM("Sending ERROR to socket %d (%d): %s\n", socket, code, e.message);
     send_all(socket, &h, sizeof(h));
     send_all(socket, &e, sizeof(e));
 }
