@@ -16,6 +16,6 @@ client: client.c protocol.h
 	$(CC) $(CFLAGS) -o $@ client.c $(LDFLAGS)
 
 clean:
-	rm -f $(BINARIES)
+	rm -f $(BINARIES) nm.log ss.log
 
 .PHONY: all clean

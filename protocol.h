@@ -11,6 +11,7 @@
 #include <time.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <errno.h>
 
 // --- CONFIGURATION ---
 
@@ -97,6 +98,20 @@ typedef enum {
         CMD_TRASH_EMPTY = 423
 } CommandCode;
 
+// --- UNIVERSAL ERROR CODES ---
+// Centralized set of error codes to be used across NM/SS/Client
+// Values intentionally mirror common HTTP semantics for familiarity.
+typedef enum {
+    EC_BAD_REQUEST            = 400,
+    EC_FORBIDDEN              = 403,
+    EC_NOT_FOUND              = 404,
+    EC_CONFLICT               = 409,
+    EC_LOCKED                 = 423,
+    EC_INTERNAL_ERROR         = 500,
+    EC_BAD_GATEWAY            = 502,
+    EC_SERVICE_UNAVAILABLE    = 503
+} ErrorCode;
+
 // --- DATA STRUCTURES ---
 // We use fixed-size structs for simple network communication.
 
@@ -108,14 +123,22 @@ typedef struct {
 
 // Data for CMD_REGISTER_SS
 // SS -> NM
+// On initialization, SS sends its client listen port and
+// a best-effort snapshot of files it currently holds.
 typedef struct {
-    int client_listen_port; // The port this SS will open for clients
+    int  client_listen_port; // The port this SS will open for clients
+    char initial_files[16384]; // optional newline-separated list of filenames
 } MsgRegisterSS;
 
 // Data for CMD_REGISTER_CLIENT
 // Client -> NM
+// Clients provide their username plus bookkeeping info about
+// their view of the network (IP/NM/SS ports) for auditing.
 typedef struct {
     char username[MAX_USERNAME_LEN];
+    char client_ip[MAX_IP_LEN]; // textual IP of the client (may be empty)
+    int  nm_port;               // NM port the client connects to
+    int  ss_port;               // client-side SS port (0 if not applicable)
 } MsgRegisterClient;
 
 // Data for CMD_ERROR
@@ -408,14 +431,55 @@ static inline void _get_ts(char* buf, size_t n) {
     strftime(buf, n, "%Y-%m-%d %H:%M:%S", &tmv);
 }
 
+// Append a single line to a component-specific log file (best-effort)
+static inline void _append_log_file(const char* comp, const char* line) {
+    const char* fname = NULL;
+    if (comp && strcmp(comp, "NM") == 0) fname = "nm.log";
+    else if (comp && strcmp(comp, "SS") == 0) fname = "ss.log";
+    else fname = "client.log";
+    FILE* lf = fopen(fname, "a");
+    if (!lf) return;
+    fputs(line, lf);
+    // Ensure newline termination for file readability
+    size_t L = strlen(line);
+    if (L == 0 || line[L-1] != '\n') fputc('\n', lf);
+    fclose(lf);
+}
+
+static inline void log_info_comp(const char* comp, const char* fmt, ...) {
+    char ts[24]; _get_ts(ts, sizeof(ts));
+    char msg[8192];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    // Console
+    printf("[%s] [%s] %s", ts, comp ? comp : "?", msg);
+    // Record
+    char line[9000];
+    snprintf(line, sizeof(line), "[%s] [%s] %s", ts, comp ? comp : "?", msg);
+    _append_log_file(comp ? comp : "?", line);
+}
+
+static inline void log_err_comp(const char* comp, const char* fmt, ...) {
+    char ts[24]; _get_ts(ts, sizeof(ts));
+    char msg[8192];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    // Console (stderr)
+    fprintf(stderr, "[%s] [%s] %s", ts, comp ? comp : "?", msg);
+    // Record
+    char line[9000];
+    snprintf(line, sizeof(line), "[%s] [%s] %s", ts, comp ? comp : "?", msg);
+    _append_log_file(comp ? comp : "?", line);
+}
+
 #define LOG_INFO_C(COMP, fmt, ...) do { \
-    char _ts[24]; _get_ts(_ts, sizeof(_ts)); \
-    printf("[%s] [%s] " fmt, _ts, COMP, ##__VA_ARGS__); \
+    log_info_comp(COMP, fmt, ##__VA_ARGS__); \
 } while(0)
 
 #define LOG_ERR_C(COMP, fmt, ...) do { \
-    char _ts[24]; _get_ts(_ts, sizeof(_ts)); \
-    fprintf(stderr, "[%s] [%s] " fmt, _ts, COMP, ##__VA_ARGS__); \
+    log_err_comp(COMP, fmt, ##__VA_ARGS__); \
 } while(0)
 
 #define LOG_NM(fmt, ...)      LOG_INFO_C("NM", fmt, ##__VA_ARGS__)

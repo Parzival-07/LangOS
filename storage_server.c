@@ -767,6 +767,8 @@ static int ensure_requests_dir_for(const char* filename, char* out_dir, size_t o
  */
 typedef struct {
     int client_socket;
+    char client_ip[INET_ADDRSTRLEN];
+    int client_port;
 } ClientSessionArgs;
 
 static void send_error_to(int sock, int code, const char* msg) {
@@ -776,6 +778,7 @@ static void send_error_to(int sock, int code, const char* msg) {
     h.payload_size = sizeof(MsgError);
     e.code = code;
     strncpy(e.message, msg ? msg : "error", sizeof(e.message)-1);
+    LOGE_SS("Sending ERROR to socket %d (%d): %s\n", sock, code, e.message);
     send_all(sock, &h, sizeof(h));
     send_all(sock, &e, sizeof(e));
 }
@@ -783,6 +786,8 @@ static void send_error_to(int sock, int code, const char* msg) {
 static void* handle_one_client(void* arg) {
     ClientSessionArgs* a = (ClientSessionArgs*)arg;
     int client_socket = a->client_socket;
+    char peer_ip[INET_ADDRSTRLEN]; strncpy(peer_ip, a->client_ip, sizeof(peer_ip)-1); peer_ip[sizeof(peer_ip)-1] = '\0';
+    int peer_port = a->client_port;
     free(a);
 
     // Always use header-based protocol for client connections.
@@ -793,6 +798,7 @@ static void* handle_one_client(void* arg) {
             if (!recv_all(client_socket, &h, sizeof(h))) {
                 break; // disconnected
             }
+            LOG_SS("[CLIENT %s:%d fd=%d] Received command %d (payload=%d)\n", peer_ip, peer_port, client_socket, h.command, h.payload_size);
 
             switch (h.command) {
                 case CMD_READ_FILE: {
@@ -807,6 +813,7 @@ static void* handle_one_client(void* arg) {
                     if (!recv_all(client_socket, &req, sizeof(req))) {
                         break;
                     }
+                    LOG_SS("[CLIENT %s:%d] READ request filename='%s' requester='%s'\n", peer_ip, peer_port, req.filename, req.requester);
                     if (!is_valid_filename(req.filename)) {
                         send_error_to(client_socket, 400, "Invalid filename");
                         continue;
@@ -842,6 +849,7 @@ static void* handle_one_client(void* arg) {
                     if (!f) { send_error_to(client_socket, 500, "Open failed"); continue; }
                     // Announce payload size as file size
                     MsgHeader rh = { .command = CMD_ACK, .payload_size = (int)st.st_size };
+                    LOG_SS("[CLIENT %s:%d] READ ACK size=%d for '%s'\n", peer_ip, peer_port, rh.payload_size, req.filename);
                     if (!send_all(client_socket, &rh, sizeof(rh))) { fclose(f); break; }
                     // Stream exact st_size bytes
                     char buf[4096]; size_t remaining = (size_t)st.st_size;
@@ -859,6 +867,7 @@ static void* handle_one_client(void* arg) {
                         FILE* mf_acc = fopen(meta_path, "a");
                         if (mf_acc) { time_t now = time(NULL); fprintf(mf_acc, "accessed:%lld\n", (long long)now); fclose(mf_acc); }
                     }
+                    LOG_SS("[CLIENT %s:%d] Completed READ for '%s'\n", peer_ip, peer_port, req.filename);
                     continue;
                 }
                 case CMD_WRITE_FILE: {
@@ -873,6 +882,7 @@ static void* handle_one_client(void* arg) {
                     if (!recv_all(client_socket, &req, sizeof(req))) {
                         break;
                     }
+                    LOG_SS("[CLIENT %s:%d] WRITE_FILE filename='%s' sidx=%d requester='%s'\n", peer_ip, peer_port, req.filename, req.sentence_index, req.requester);
                     if (!is_valid_filename(req.filename) || req.sentence_index < 0) {
                         send_error_to(client_socket, 400, "Invalid arguments");
                         continue;
@@ -916,6 +926,7 @@ static void* handle_one_client(void* arg) {
                         }
                         // Return ACK; keep lock held until client sends CMD_WRITE_DONE
                         MsgHeader rh = { .command = CMD_ACK, .payload_size = 0 };
+                        LOG_SS("[CLIENT %s:%d] WRITE_FILE ACK for '%s' used_idx=%d delta=%d\n", peer_ip, peer_port, req.filename, used_idx, delta);
                         if (!send_all(client_socket, &rh, sizeof(rh))) {
                             // client gone; proactively release to avoid dangling lock
                             sentence_lock_release(req.filename, used_idx);
@@ -924,6 +935,7 @@ static void* handle_one_client(void* arg) {
                     } else {
                         // On failure, release the lock so client can retry
                         sentence_lock_release(req.filename, used_idx);
+                        LOGE_SS("[CLIENT %s:%d] WRITE_FILE failed for '%s': %s\n", peer_ip, peer_port, req.filename, err);
                         send_error_to(client_socket, 500, err[0] ? err : "WRITE failed");
                     }
                     continue;
@@ -938,6 +950,7 @@ static void* handle_one_client(void* arg) {
                     }
                     MsgWriteBegin req;
                     if (!recv_all(client_socket, &req, sizeof(req))) { break; }
+                    LOG_SS("[CLIENT %s:%d] WRITE_BEGIN filename='%s' sidx=%d requester='%s'\n", peer_ip, peer_port, req.filename, req.sentence_index, req.requester);
                     if (!is_valid_filename(req.filename) || req.sentence_index < 0) {
                         send_error_to(client_socket, 400, "Invalid arguments");
                         continue;
@@ -962,6 +975,7 @@ static void* handle_one_client(void* arg) {
                         continue;
                     }
                     MsgHeader rh = { .command = CMD_ACK, .payload_size = 0 };
+                    LOG_SS("[CLIENT %s:%d] WRITE_BEGIN ACK for '%s' sidx=%d\n", peer_ip, peer_port, req.filename, req.sentence_index);
                     send_all(client_socket, &rh, sizeof(rh));
                     continue;
                 }
@@ -977,6 +991,7 @@ static void* handle_one_client(void* arg) {
                     if (!recv_all(client_socket, &done, sizeof(done))) {
                         break;
                     }
+                    LOG_SS("[CLIENT %s:%d] WRITE_DONE filename='%s' sidx=%d requester='%s'\n", peer_ip, peer_port, done.filename, done.sentence_index, done.requester);
                     // Release the caller's lock on this file even if index shifted
                     if (!sentence_lock_owned_by(done.filename, done.sentence_index, client_socket)) {
                         int slot = sentence_lock_find_for_owner(done.filename, client_socket);
@@ -987,6 +1002,7 @@ static void* handle_one_client(void* arg) {
                         sentence_lock_release(done.filename, done.sentence_index);
                     }
                     MsgHeader rh = { .command = CMD_ACK, .payload_size = 0 };
+                    LOG_SS("[CLIENT %s:%d] WRITE_DONE ACK for '%s'\n", peer_ip, peer_port, done.filename);
                     send_all(client_socket, &rh, sizeof(rh));
                     continue;
                 }
@@ -1003,6 +1019,7 @@ static void* handle_one_client(void* arg) {
                     }
                     MsgStreamRequest rq;
                     if (!recv_all(client_socket, &rq, sizeof(rq))) { break; }
+                    LOG_SS("[CLIENT %s:%d] STREAM request filename='%s' requester='%s'\n", peer_ip, peer_port, rq.filename, rq.requester);
                     if (!is_valid_filename(rq.filename)) { send_error_to(client_socket, 400, "Invalid filename"); close(client_socket); sentence_lock_release_all_for_owner(client_socket); return NULL; }
                     // ACL: owner/readers/writers can stream (writers imply read)
                     if (rq.requester[0] == '\0') { send_error_to(client_socket, 403, "Unauthorized"); close(client_socket); sentence_lock_release_all_for_owner(client_socket); return NULL; }
@@ -1025,6 +1042,7 @@ static void* handle_one_client(void* arg) {
                     char path[512]; snprintf(path, sizeof(path), STORAGE_ROOT "/%s", rq.filename);
                     FILE* f = fopen(path, "rb"); if (!f) { send_error_to(client_socket, 404, "Not found"); close(client_socket); sentence_lock_release_all_for_owner(client_socket); return NULL; }
                     // Stream word-by-word but preserve original whitespace and do not add extra '\n' per word.
+                    LOG_SS("[CLIENT %s:%d] STREAM start '%s'\n", peer_ip, peer_port, rq.filename);
                     // We insert a 0.1s delay after sending each word (and its following whitespace) to simulate streaming.
                     int c; int in_word = 0; char word[4096]; size_t wpos = 0;
                     while ((c = fgetc(f)) != EOF) {
@@ -1063,6 +1081,7 @@ static void* handle_one_client(void* arg) {
                     fclose(f);
                     // Signal end with a sentinel line the client can detect
                     (void)send_all(client_socket, "STOP\n", 5);
+                    LOG_SS("[CLIENT %s:%d] STREAM end '%s'\n", peer_ip, peer_port, rq.filename);
                     // Record access time in metadata (portable alternative to atime)
                     {
                         char meta_path[512]; snprintf(meta_path, sizeof(meta_path), STORAGE_ROOT "/%s.meta", rq.filename);
@@ -1125,17 +1144,22 @@ void* handle_client_connections(void* arg) {
     // --- Accept Loop for Clients ---
     while (true) {
         int client_socket;
-        if ((client_socket = accept(server_fd, NULL, NULL)) < 0) {
+        struct sockaddr_in caddr; socklen_t clen = sizeof(caddr);
+        if ((client_socket = accept(server_fd, (struct sockaddr*)&caddr, &clen)) < 0) {
             LOGE_SS("Client accept failed: %s\n", strerror(errno));
             continue;
         }
-        LOG_SS("Received a direct client connection!\n");
+        char ipbuf[INET_ADDRSTRLEN] = {0}; inet_ntop(AF_INET, &caddr.sin_addr, ipbuf, sizeof(ipbuf));
+        int cport = (int)ntohs(caddr.sin_port);
+        LOG_SS("Received a direct client connection from %s:%d (fd=%d)\n", ipbuf, cport, client_socket);
 
         // Spawn a detached thread per client to handle header-based loop or legacy read
         pthread_t tid;
         ClientSessionArgs* a = (ClientSessionArgs*)malloc(sizeof(ClientSessionArgs));
         if (!a) { close(client_socket); continue; }
         a->client_socket = client_socket;
+        strncpy(a->client_ip, ipbuf, sizeof(a->client_ip)-1); a->client_ip[sizeof(a->client_ip)-1] = '\0';
+        a->client_port = cport;
         if (pthread_create(&tid, NULL, handle_one_client, a) != 0) {
             LOGE_SS("pthread_create (client session) failed: %s\n", strerror(errno));
             close(client_socket);
@@ -1154,6 +1178,7 @@ static void nm_send_error(int code, const char* msg) {
     h.payload_size = sizeof(MsgError);
     e.code = code;
     strncpy(e.message, msg ? msg : "error", sizeof(e.message)-1);
+    LOGE_SS("Sending ERROR to NM (%d): %s\n", code, e.message);
     send_all(nm_socket, &h, sizeof(h));
     send_all(nm_socket, &e, sizeof(e));
 }
@@ -1171,16 +1196,62 @@ void* listen_to_nm(void* arg) {
             exit(EXIT_FAILURE); // If NM is down, SS can't function
         }
 
-        LOG_SS("Received command %d from Name Server.\n", header.command);
+    LOG_SS("[NM] Received command %d (payload=%d)\n", header.command, header.payload_size);
         
         // Handle commands from NM
     switch (header.command) {
+            case CMD_READ_FILE: {
+                if (header.payload_size != sizeof(MsgReadFile)) { nm_send_error(400, "Bad payload size"); break; }
+                MsgReadFile req; if (!recv_all(nm_socket, &req, sizeof(req))) { nm_send_error(400, "Payload read failed"); break; }
+                if (!is_valid_filename(req.filename)) { nm_send_error(400, "Invalid filename"); break; }
+                // ACL check: requester must be owner or in readers or writers
+                if (req.requester[0] == '\0') { nm_send_error(403, "Unauthorized"); break; }
+                char meta[512]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", req.filename);
+                FILE* mf = fopen(meta, "r"); if (!mf) { nm_send_error(404, "Not found"); break; }
+                char owner[MAX_USERNAME_LEN] = {0};
+                char readers[1024] = {0}, writers[1024] = {0}; char line2[2048];
+                while (fgets(line2, sizeof(line2), mf)) {
+                    if (strncmp(line2, "owner:", 6) == 0) { sscanf(line2+6, "%63s", owner); }
+                    else if (strncmp(line2, "readers:", 8) == 0) { strncpy(readers, line2+8, sizeof(readers)-1); }
+                    else if (strncmp(line2, "writers:", 8) == 0) { strncpy(writers, line2+8, sizeof(writers)-1); }
+                }
+                fclose(mf);
+                trim_both(readers); trim_both(writers);
+                if (!( (owner[0] && strncmp(owner, req.requester, MAX_USERNAME_LEN)==0) ||
+                       list_contains(readers, req.requester) ||
+                       list_contains(writers, req.requester) )) {
+                    nm_send_error(403, "Unauthorized");
+                    break;
+                }
+                char path[512]; snprintf(path, sizeof(path), STORAGE_ROOT "/%s", req.filename);
+                struct stat st; if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) { nm_send_error(404, "Not found"); break; }
+                FILE* f = fopen(path, "rb"); if (!f) { nm_send_error(500, "Open failed"); break; }
+                MsgHeader rh = { .command = CMD_ACK, .payload_size = (int)st.st_size };
+                LOG_SS("[NM] READ ACK size=%d for '%s' requester='%s'\n", rh.payload_size, req.filename, req.requester);
+                if (!send_all(nm_socket, &rh, sizeof(rh))) { fclose(f); break; }
+                char buf[4096]; size_t remaining = (size_t)st.st_size;
+                while (remaining > 0) {
+                    size_t to_read = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+                    size_t nr = fread(buf, 1, to_read, f);
+                    if (nr == 0) break;
+                    if (!send_all(nm_socket, buf, nr)) { remaining = 0; break; }
+                    remaining -= nr;
+                }
+                fclose(f);
+                // Record access time in metadata
+                {
+                    char meta_path[512]; snprintf(meta_path, sizeof(meta_path), STORAGE_ROOT "/%s.meta", req.filename);
+                    FILE* mf_acc = fopen(meta_path, "a");
+                    if (mf_acc) { time_t now = time(NULL); fprintf(mf_acc, "accessed:%lld\n", (long long)now); fclose(mf_acc); }
+                }
+                break;
+            }
             case CMD_CLEAR_FILE: {
                 if (header.payload_size != sizeof(MsgClearFile)) { nm_send_error(400, "Bad payload size"); break; }
                 MsgClearFile msg; if (!recv_all(nm_socket, &msg, sizeof(msg))) { nm_send_error(400, "Payload read failed"); break; }
                 if (!is_valid_filename(msg.filename)) { nm_send_error(400, "Invalid filename"); break; }
                 // Disallow while any sentence locks are active for this file
-                if (sentence_lock_any_for_file(msg.filename)) { nm_send_error(423, "File has active write lock"); break; }
+                if (sentence_lock_any_for_file(msg.filename)) { LOGE_SS("[NM] CLEAR denied due to active lock '%s' requester='%s'\n", msg.filename, msg.requester); nm_send_error(423, "File has active write lock"); break; }
                 // ACL: owner or writer may clear
                 char meta[512]; snprintf(meta, sizeof(meta), STORAGE_ROOT "/%s.meta", msg.filename);
                 FILE* mf = fopen(meta, "r"); if (!mf) { nm_send_error(404, "File not found"); break; }
@@ -1204,6 +1275,7 @@ void* listen_to_nm(void* arg) {
                 // Update metadata 'updated' timestamp
                 mf = fopen(meta, "a"); if (mf) { fprintf(mf, "updated:%lld\n", (long long)time(NULL)); fclose(mf); }
                 MsgHeader ack = (MsgHeader){ .command = CMD_ACK, .payload_size = 0 };
+                LOG_SS("[NM] CLEAR ACK '%s' by '%s'\n", msg.filename, msg.requester);
                 send_all(nm_socket, &ack, sizeof(ack));
                 break;
             }
@@ -1225,6 +1297,7 @@ void* listen_to_nm(void* arg) {
                     closedir(d);
                 }
                 MsgHeader h = { .command = CMD_TRASH_LIST_RESP, .payload_size = sizeof(resp) };
+                LOG_SS("[NM] TRASH_LIST respond owner='%s' bytes=%zu\n", msg.owner, sizeof(resp));
                 send_all(nm_socket, &h, sizeof(h));
                 send_all(nm_socket, &resp, sizeof(resp));
                 break;
@@ -1246,7 +1319,7 @@ void* listen_to_nm(void* arg) {
                 // Ensure root exists
                 if (ensure_dir(STORAGE_ROOT) != 0) { nm_send_error(500, "Storage dir error"); break; }
                 // Move back
-                if (rename(src_txt, dst_txt) != 0) { nm_send_error(404, "Not in trash"); break; }
+                if (rename(src_txt, dst_txt) != 0) { LOGE_SS("[NM] RECOVER src missing '%s' owner='%s'\n", msg.filename, msg.owner); nm_send_error(404, "Not in trash"); break; }
                 if (rename(src_meta, dst_meta) != 0) { // rollback
                     rename(dst_txt, src_txt);
                     nm_send_error(500, "Recover failed"); break;
@@ -1254,6 +1327,7 @@ void* listen_to_nm(void* arg) {
                 // Update updated timestamp
                 FILE* mf = fopen(dst_meta, "a"); if (mf) { fprintf(mf, "recovered:%lld\n", (long long)time(NULL)); fclose(mf);}                
                 MsgHeader ack = { .command = CMD_ACK, .payload_size = 0 };
+                LOG_SS("[NM] RECOVER ACK '%s' as '%s' owner='%s'\n", msg.filename, outname, msg.owner);
                 send_all(nm_socket, &ack, sizeof(ack));
                 break;
             }
@@ -1277,9 +1351,10 @@ void* listen_to_nm(void* arg) {
                     char t1[1024], t2[1024]; snprintf(t1,sizeof(t1), "%s/%s", base, msg.filename); snprintf(t2,sizeof(t2), "%s/%s.meta", base, msg.filename);
                     if (remove(t1)!=0) errs++; if (remove(t2)!=0) errs++; acted=1;
                 }
-                if (!acted) { nm_send_error(404, "Nothing to remove"); break; }
-                if (errs) { nm_send_error(500, "Some items could not be removed"); break; }
+                if (!acted) { LOGE_SS("[NM] EMPTYTRASH no items for owner='%s'\n", msg.owner); nm_send_error(404, "Nothing to remove"); break; }
+                if (errs) { LOGE_SS("[NM] EMPTYTRASH partial failure for owner='%s'\n", msg.owner); nm_send_error(500, "Some items could not be removed"); break; }
                 MsgHeader ack = (MsgHeader){ .command = CMD_ACK, .payload_size = 0 };
+                LOG_SS("[NM] EMPTYTRASH ACK owner='%s' all=%d file='%s'\n", msg.owner, msg.all, msg.filename);
                 send_all(nm_socket, &ack, sizeof(ack));
                 break;
             }
@@ -1298,6 +1373,7 @@ void* listen_to_nm(void* arg) {
                 if (rc == 0) {
                     LOG_SS("Created file '%s' for owner '%s'\n", msg.filename, msg.owner);
                     MsgHeader ack = { .command = CMD_ACK, .payload_size = 0 };
+                    LOG_SS("[NM] CREATE ACK '%s' owner='%s'\n", msg.filename, msg.owner);
                     send_all(nm_socket, &ack, sizeof(ack));
                 } else {
                     LOGE_SS("CREATE failed for '%s': %s\n", msg.filename, err);
@@ -1348,6 +1424,7 @@ void* listen_to_nm(void* arg) {
                 MsgHeader h = {0};
                 h.command = CMD_SS_LIST_FILES_RESP;
                 h.payload_size = sizeof(resp);
+                LOG_SS("[NM] SS_LIST_FILES_RESP bytes=%zu\n", sizeof(resp));
                 send_all(nm_socket, &h, sizeof(h));
                 send_all(nm_socket, &resp, sizeof(resp));
                 break;
@@ -1384,6 +1461,7 @@ void* listen_to_nm(void* arg) {
                 if (rc == 0) {
                     LOG_SS("Moved file '%s' to trash for owner '%s'\n", msg.filename, owner);
                     MsgHeader ack = { .command = CMD_ACK, .payload_size = 0 };
+                    LOG_SS("[NM] DELETE ACK '%s' requester='%s'\n", msg.filename, msg.requester);
                     send_all(nm_socket, &ack, sizeof(ack));
                 } else {
                     LOGE_SS("DELETE failed for '%s'\n", msg.filename);
@@ -1463,6 +1541,7 @@ void* listen_to_nm(void* arg) {
                 fclose(mf);
 
                 MsgHeader ack = { .command = CMD_ACK, .payload_size = 0 };
+                LOG_SS("[NM] %s '%s' target='%s' by '%s' ACK\n", (header.command==CMD_ADD_ACCESS?"ADD_ACCESS":"REM_ACCESS"), msg.filename, msg.target, msg.requester);
                 send_all(nm_socket, &ack, sizeof(ack));
                 break;
             }
@@ -1534,6 +1613,7 @@ void* listen_to_nm(void* arg) {
                          readers[0]?readers:"",
                          writers[0]?writers:"");
                 MsgHeader h = { .command = CMD_INFO_RESP, .payload_size = sizeof(resp) };
+                LOG_SS("[NM] INFO RESP for '%s' bytes=%zu\n", req.filename, sizeof(resp));
                 send_all(nm_socket, &h, sizeof(h));
                 send_all(nm_socket, &resp, sizeof(resp));
                 break;
@@ -1561,8 +1641,10 @@ void* listen_to_nm(void* arg) {
                 char err[256] = {0};
                 if (undo_restore_last(req.filename, err, sizeof(err)) == 0) {
                     MsgHeader ack = (MsgHeader){ .command = CMD_ACK, .payload_size = 0 };
+                    LOG_SS("[NM] UNDO ACK '%s' requester='%s'\n", req.filename, req.requester);
                     send_all(nm_socket, &ack, sizeof(ack));
                 } else {
+                    LOGE_SS("[NM] UNDO failed '%s': %s\n", req.filename, err);
                     nm_send_error(404, err[0]?err:"No undo available");
                 }
                 break;
@@ -1592,7 +1674,7 @@ void* listen_to_nm(void* arg) {
                 if(file_exists(rpath)){ nm_send_error(409,"Request exists"); break; }
                 FILE* rf=fopen(rpath,"w"); if(!rf){ nm_send_error(500,"Create failed"); break; }
                 fprintf(rf, "%s\n", msg.want_write?"WRITE":"READ"); fclose(rf);
-                MsgHeader ack={ .command=CMD_ACK, .payload_size=0 }; send_all(nm_socket,&ack,sizeof(ack));
+                MsgHeader ack={ .command=CMD_ACK, .payload_size=0 }; LOG_SS("[NM] REQUEST_ACCESS ACK file='%s' requester='%s' write=%d\n", msg.filename, msg.requester, msg.want_write); send_all(nm_socket,&ack,sizeof(ack));
                 break;
             }
             // --- ACCESS REQUEST LIST ---
@@ -1608,7 +1690,7 @@ void* listen_to_nm(void* arg) {
                     MsgAccessRequestListResp resp={0}; MsgHeader h={ .command=CMD_LIST_REQUESTS_RESP, .payload_size=sizeof(resp)}; send_all(nm_socket,&h,sizeof(h)); send_all(nm_socket,&resp,sizeof(resp)); break; }
                 DIR* d=opendir(rdir); MsgAccessRequestListResp resp={0}; size_t pos=0; if(d){ struct dirent* ent; while((ent=readdir(d))!=NULL){ if(strcmp(ent->d_name,".")==0||strcmp(ent->d_name,"..")==0) continue; size_t elen=strlen(ent->d_name); if(elen>4 && strcmp(ent->d_name+elen-4,".req")==0){ char user[MAX_USERNAME_LEN]={0}; size_t ulen=elen-4; if(ulen >= MAX_USERNAME_LEN) ulen=MAX_USERNAME_LEN-1; memcpy(user, ent->d_name, ulen); char fpath[700]; snprintf(fpath,sizeof(fpath), "%s/%s", rdir, ent->d_name); FILE* rf=fopen(fpath,"r"); if(rf){ char typ[16]={0}; if(fgets(typ,sizeof(typ),rf)){ typ[strcspn(typ,"\r\n")]=0; char linebuf[256]; snprintf(linebuf,sizeof(linebuf), "%s\t%s\n", user, strcmp(typ,"WRITE")==0?"WRITE":"READ"); size_t ln=strlen(linebuf); if(pos+ln < sizeof(resp.requests)){ memcpy(resp.requests+pos,linebuf,ln); pos+=ln; } } fclose(rf);} } }
                     closedir(d); }
-                MsgHeader h={ .command=CMD_LIST_REQUESTS_RESP, .payload_size=sizeof(resp)}; send_all(nm_socket,&h,sizeof(h)); send_all(nm_socket,&resp,sizeof(resp));
+                MsgHeader h={ .command=CMD_LIST_REQUESTS_RESP, .payload_size=sizeof(resp)}; LOG_SS("[NM] LIST_REQUESTS RESP file='%s' bytes=%zu\n", msg.filename, sizeof(resp)); send_all(nm_socket,&h,sizeof(h)); send_all(nm_socket,&resp,sizeof(resp));
                 break;
             }
             // --- ACCESS REQUEST RESPOND ---
@@ -1650,7 +1732,7 @@ void* listen_to_nm(void* arg) {
                     fclose(mw);
                 }
                 remove(rpath); // remove request regardless of approve/deny
-                MsgHeader ack={ .command=CMD_ACK, .payload_size=0 }; send_all(nm_socket,&ack,sizeof(ack));
+                MsgHeader ack={ .command=CMD_ACK, .payload_size=0 }; LOG_SS("[NM] RESPOND_REQUEST ACK file='%s' target='%s' approve=%d write=%d\n", msg.filename, msg.target, msg.approve, msg.grant_write); send_all(nm_socket,&ack,sizeof(ack));
                 break;
             }
             // --- CHECKPOINT CREATE ---
@@ -1682,7 +1764,7 @@ void* listen_to_nm(void* arg) {
                 char buf[4096]; size_t n; while((n=fread(buf,1,sizeof(buf),src))>0){ if(fwrite(buf,1,n,dst)!=n){ fclose(src); fclose(dst); nm_send_error(500,"Write checkpoint failed"); goto chk_create_end; }}
                 fclose(src); fclose(dst);
                 {
-                    MsgHeader ack = { .command = CMD_ACK, .payload_size = 0 }; send_all(nm_socket,&ack,sizeof(ack));
+                    MsgHeader ack = { .command = CMD_ACK, .payload_size = 0 }; LOG_SS("[NM] CHECKPOINT_CREATE ACK '%s' tag='%s'\n", msg.filename, msg.tag); send_all(nm_socket,&ack,sizeof(ack));
                 }
 chk_create_end:
                 break;
@@ -1702,7 +1784,7 @@ chk_create_end:
                 if(d){ struct dirent* ent; size_t pos=0; while((ent=readdir(d))!=NULL){ if(strcmp(ent->d_name,".")==0||strcmp(ent->d_name,"..")==0) continue; size_t ln=strlen(ent->d_name); if(pos+ln+1 < sizeof(resp.tags)){ memcpy(resp.tags+pos, ent->d_name, ln); pos+=ln; resp.tags[pos++]='\n'; } }
                     closedir(d);
                 }
-                MsgHeader hresp = { .command = CMD_CHECKPOINT_LIST_RESP, .payload_size = sizeof(resp) }; send_all(nm_socket,&hresp,sizeof(hresp)); send_all(nm_socket,&resp,sizeof(resp));
+                MsgHeader hresp = { .command = CMD_CHECKPOINT_LIST_RESP, .payload_size = sizeof(resp) }; LOG_SS("[NM] CHECKPOINT_LIST RESP '%s' bytes=%zu\n", msg.filename, sizeof(resp)); send_all(nm_socket,&hresp,sizeof(hresp)); send_all(nm_socket,&resp,sizeof(resp));
                 break;
             }
             // --- CHECKPOINT VIEW ---
@@ -1718,7 +1800,7 @@ chk_create_end:
                 if(!( (owner[0]&&msg.requester[0]&&strncmp(owner,msg.requester,MAX_USERNAME_LEN)==0) || list_contains(readers,msg.requester) || list_contains(writers,msg.requester) )){ nm_send_error(403,"Unauthorized"); break; }
                 char chkpath[700]; snprintf(chkpath,sizeof(chkpath), STORAGE_ROOT "/.checkpoints/%s/%s", msg.filename, msg.tag); struct stat st; if(stat(chkpath,&st)!=0||!S_ISREG(st.st_mode)){ nm_send_error(404,"Checkpoint not found"); break; }
                 FILE* f=fopen(chkpath,"rb"); if(!f){ nm_send_error(500,"Open failed"); break; }
-                MsgHeader ack = { .command = CMD_ACK, .payload_size = (int)st.st_size }; if(!send_all(nm_socket,&ack,sizeof(ack))){ fclose(f); break; }
+                MsgHeader ack = { .command = CMD_ACK, .payload_size = (int)st.st_size }; LOG_SS("[NM] CHECKPOINT_VIEW ACK '%s' tag='%s' size=%d\n", msg.filename, msg.tag, ack.payload_size); if(!send_all(nm_socket,&ack,sizeof(ack))){ fclose(f); break; }
                 char buf[4096]; size_t rem = (size_t)st.st_size; while(rem>0){ size_t chunk = rem>sizeof(buf)?sizeof(buf):rem; size_t nr=fread(buf,1,chunk,f); if(nr==0) break; if(!send_all(nm_socket,buf,nr)) break; rem -= nr; }
                 fclose(f);
                 break;
@@ -1750,7 +1832,7 @@ chk_create_end:
                         else if(strncmp(lb,"readers:",8)==0){ strncpy(readers_k,lb+8,sizeof(readers_k)-1); }
                         else if(strncmp(lb,"writers:",8)==0){ strncpy(writers_k,lb+8,sizeof(writers_k)-1); }
                     } fclose(mfr); trim_both(readers_k); trim_both(writers_k);} FILE* mfw=fopen(meta,"w"); if(mfw){ time_t now=time(NULL); fprintf(mfw,"owner:%s\ncreated:%lld\nupdated:%lld\n", owner_k, created_k, (long long)now); if(accessed_keep>0) fprintf(mfw,"accessed:%lld\n", accessed_keep); fprintf(mfw,"readers:%s%s\n", (readers_k[0]?" ":""), readers_k); fprintf(mfw,"writers:%s%s\n", (writers_k[0]?" ":""), writers_k); fclose(mfw);} }
-                MsgHeader ack={ .command=CMD_ACK, .payload_size=0 }; send_all(nm_socket,&ack,sizeof(ack));
+                MsgHeader ack={ .command=CMD_ACK, .payload_size=0 }; LOG_SS("[NM] CHECKPOINT_REVERT ACK '%s' tag='%s'\n", msg.filename, msg.tag); send_all(nm_socket,&ack,sizeof(ack));
 chk_revert_end:
                 break;
             }
@@ -1819,11 +1901,41 @@ int main(int argc, char const *argv[]) {
     MsgHeader header;
     MsgRegisterSS reg_msg;
 
+    memset(&reg_msg, 0, sizeof(reg_msg));
     header.command = CMD_REGISTER_SS;
     header.payload_size = sizeof(MsgRegisterSS);
     reg_msg.client_listen_port = client_listen_port;
 
-    LOG_SS("Registering with NM (Client Port: %d)...\n", client_listen_port);
+    // Build initial file list (newline-separated) as a best-effort snapshot
+    DIR* d = opendir(STORAGE_ROOT);
+    if (d) {
+        struct dirent* de;
+        size_t used = 0;
+        while ((de = readdir(d)) != NULL) {
+            const char* name = de->d_name;
+            if (!name || name[0] == '.') continue; // skip . and .. and hidden
+            // Skip metadata files (*.meta) and any directories
+            const char* dot = strrchr(name, '.');
+            if (dot && strcmp(dot, ".meta") == 0) continue;
+            // Build full path and ensure it's a regular file
+            char pbuf[512];
+            snprintf(pbuf, sizeof(pbuf), STORAGE_ROOT "/%s", name);
+            struct stat st;
+            if (stat(pbuf, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+
+            size_t len = strlen(name);
+            if (len + 1 > sizeof(reg_msg.initial_files) - used - 1) break;
+            memcpy(reg_msg.initial_files + used, name, len);
+            used += len;
+            reg_msg.initial_files[used++] = '\n';
+            reg_msg.initial_files[used] = '\0';
+        }
+        closedir(d);
+    }
+
+    LOG_SS("Registering with NM (Client Port: %d, %sinitial file list sent)...\n",
+           client_listen_port,
+           reg_msg.initial_files[0] ? "" : "no ");
 
     // Send header, then payload
     if (!send_all(nm_socket, &header, sizeof(MsgHeader))) return 1;

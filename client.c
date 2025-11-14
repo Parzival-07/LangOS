@@ -116,12 +116,37 @@ int main() {
     // --- Register with Name Server ---
     MsgHeader header;
     MsgRegisterClient reg_msg;
-    
+
+    memset(&reg_msg, 0, sizeof(reg_msg));
     header.command = CMD_REGISTER_CLIENT;
     header.payload_size = sizeof(MsgRegisterClient);
-    strncpy(reg_msg.username, username, MAX_USERNAME_LEN);
 
-    LOG_CLIENT("Registering as '%s'...\n", username);
+    // Fill username
+    strncpy(reg_msg.username, username, MAX_USERNAME_LEN - 1);
+    reg_msg.username[MAX_USERNAME_LEN - 1] = '\0';
+
+    // Derive client IP as seen on this socket (best-effort)
+    struct sockaddr_in local_addr;
+    socklen_t la_len = sizeof(local_addr);
+    char cip[MAX_IP_LEN] = {0};
+    if (getsockname(nm_socket, (struct sockaddr*)&local_addr, &la_len) == 0) {
+        inet_ntop(AF_INET, &local_addr.sin_addr, cip, sizeof(cip));
+    }
+    if (cip[0]) {
+        strncpy(reg_msg.client_ip, cip, MAX_IP_LEN - 1);
+        reg_msg.client_ip[MAX_IP_LEN - 1] = '\0';
+    }
+
+    // NM port is known from configuration
+    reg_msg.nm_port = NAME_SERVER_PORT;
+    // Provide a concrete local port (best-effort) for bookkeeping, as per spec
+    reg_msg.ss_port = (int)ntohs(local_addr.sin_port);
+
+    LOG_CLIENT("Registering as '%s' (ip=%s, nm_port=%d, ss_port=%d)...\n",
+               username,
+               reg_msg.client_ip[0] ? reg_msg.client_ip : "",
+               reg_msg.nm_port,
+               reg_msg.ss_port);
     if (!send_all(nm_socket, &header, sizeof(MsgHeader))) return 1;
     if (!send_all(nm_socket, &reg_msg, sizeof(MsgRegisterClient))) return 1;
     
