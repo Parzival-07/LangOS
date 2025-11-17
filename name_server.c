@@ -49,6 +49,13 @@ typedef struct {
 ConnectionInfo connections[MAX_CONNECTIONS];
 pthread_mutex_t connections_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// --- HISTORICAL USER TRACKING (for LIST command) ---
+// Track all users ever registered, not just currently connected
+#define MAX_HISTORICAL_USERS 1024
+static char historical_users[MAX_HISTORICAL_USERS][MAX_USERNAME_LEN];
+static int historical_user_count = 0;
+static pthread_mutex_t historical_users_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // --- FILE REGISTRY (maintained by NM) ---
 #define MAX_FILES 10000
 typedef struct {
@@ -1230,25 +1237,25 @@ void* handle_connection(void* arg) {
                 while (rem > 0) { size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem; if (!recv_all(socket, drain, chunk)) break; rem -= chunk; }
             }
 
-            // Assemble list of currently registered clients
+            // Assemble list of ALL registered users (historical + current)
             MsgUsersListResponse resp = {0};
             size_t pos = 0, cap = sizeof(resp.users);
-            pthread_mutex_lock(&connections_mutex);
-            for (int i = 0; i < MAX_CONNECTIONS; i++) {
-                if (connections[i].type == CONN_TYPE_CLIENT && connections[i].username[0]) {
-                    const char* u = connections[i].username;
-                    size_t ulen = strnlen(u, MAX_USERNAME_LEN);
-                    if (ulen + 1 <= cap - pos) {
-                        memcpy(resp.users + pos, u, ulen); pos += ulen; resp.users[pos++] = '\n';
-                    } else {
-                        break; // buffer full
-                    }
+            pthread_mutex_lock(&historical_users_mutex);
+            for (int i = 0; i < historical_user_count; i++) {
+                const char* u = historical_users[i];
+                size_t ulen = strnlen(u, MAX_USERNAME_LEN);
+                if (ulen > 0 && ulen + 1 <= cap - pos) {
+                    memcpy(resp.users + pos, u, ulen); 
+                    pos += ulen; 
+                    resp.users[pos++] = '\n';
+                } else if (ulen + 1 > cap - pos) {
+                    break; // buffer full
                 }
             }
-            pthread_mutex_unlock(&connections_mutex);
+            pthread_mutex_unlock(&historical_users_mutex);
 
             MsgHeader h = { .command = CMD_LIST_USERS_RESP, .payload_size = sizeof(resp) };
-            LOG_NM("LIST users count response bytes=%zu to user='%s'\n", sizeof(resp), connections[slot].username);
+            LOG_NM("LIST users response (total registered: %d) bytes=%zu to user='%s'\n", historical_user_count, sizeof(resp), connections[slot].username);
             send_all(socket, &h, sizeof(h));
             send_all(socket, &resp, sizeof(resp));
             continue;
@@ -1625,6 +1632,23 @@ void handle_register_client(int slot, const MsgRegisterClient* msg) {
         connections[slot].ip_addr[INET_ADDRSTRLEN - 1] = '\0';
     }
     pthread_mutex_unlock(&connections_mutex);
+
+    // Add user to historical list if not already present
+    pthread_mutex_lock(&historical_users_mutex);
+    int found = 0;
+    for (int i = 0; i < historical_user_count; i++) {
+        if (strcmp(historical_users[i], msg->username) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    if (!found && historical_user_count < MAX_HISTORICAL_USERS) {
+        strncpy(historical_users[historical_user_count], msg->username, MAX_USERNAME_LEN - 1);
+        historical_users[historical_user_count][MAX_USERNAME_LEN - 1] = '\0';
+        historical_user_count++;
+        LOG_NM("Added '%s' to historical users list (total: %d)\n", msg->username, historical_user_count);
+    }
+    pthread_mutex_unlock(&historical_users_mutex);
 
     LOG_NM("Client '%s' registered (ip=%s, nm_port=%d, ss_port=%d, slot=%d)\n",
         connections[slot].username,
