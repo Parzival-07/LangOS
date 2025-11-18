@@ -2,12 +2,19 @@
 
 # Distributed File Collaboration System — User Manual
 
-This project implements a simple distributed file collaboration system with three components:
-- Name Server (NM): registry, routing, user list, access request workflow, and exec helper.
-- Storage Server (SS): stores files and metadata, enforces ACLs/locks, trash, checkpoints, undo, stream.
-- Client CLI: interactive REPL with colorized logs and commands for all features.
+This project implements a distributed file collaboration system with three components:
+- **Name Server (NM)**: Central registry, file routing, user tracking, and command execution helper
+- **Storage Server (SS)**: File storage with metadata, ACL enforcement, sentence-level locking, checkpoints, undo history, and trash bin
+- **Client CLI**: Interactive REPL with colorized logs for all user operations
 
-Defaults: Name Server listens on 127.0.0.1:8000. Storage data root is `ss_data/`.
+**Defaults**: Name Server listens on `127.0.0.1:8000`. Storage data root is `ss_data/`.
+
+**Key Design Decisions**:
+- Binary protocol with size-prefixed messages (no sentinel collisions)
+- O(1) file lookup using FNV-1a hash map (4096 buckets)
+- Sentence-level write locking for concurrent editing
+- Persistent metadata and undo history
+- Trash bin for recoverable deletions
 
 ## Build and Run
 
@@ -25,267 +32,841 @@ Defaults: Name Server listens on 127.0.0.1:8000. Storage data root is `ss_data/`
 
 Order matters: start NM → SS → client. Each Storage Server registers itself with the Name Server.
 
-## File and Access Model (at a glance)
+## Architecture & Data Model
 
-- Each file has: owner, readers, writers; writer implies reader.
-- Metadata lives in `ss_data/<file>.meta` with fields: owner, created, updated, accessed, readers, writers.
-- INFO shows size (bytes/words/chars), last_access, last_modified, owner/ACL.
-- Sentence-level write locks: WRITE, CLEAR, REVERT, DELETE are blocked while any write lock is active (423).
-- Undo snapshots are taken before content-changing operations, enabling UNDO to restore previous content.
+### File Metadata
+Each file has a corresponding `.meta` file in `ss_data/` containing:
+- **owner**: Username who created the file (cannot be changed)
+- **created**: Unix timestamp of file creation
+- **updated**: Unix timestamp of last content modification (WRITE/CLEAR/UNDO/REVERT)
+- **accessed**: Unix timestamp of last read/stream operation (updated on READ/STREAM)
+- **readers**: Comma-separated list of usernames with read access
+- **writers**: Comma-separated list of usernames with write access (writer implies reader)
 
-## Core Commands (Client)
+### Access Control Rules
+- **Owner**: Full control (read, write, delete, modify ACL)
+- **Writer**: Can read, write, and delete; cannot modify ACL
+- **Reader**: Can read only
+- **Implicit access**: Writers automatically have read access
 
-### Create / Delete / Clear
+### Locking Mechanism
+- **Sentence-level locks**: Files are parsed into sentences by delimiters (`.`, `!`, `?`)
+- **Lock granularity**: Each sentence can be locked independently (2048 lock slots)
+- **Lock scope**: WRITE acquires lock on specific sentence; CLEAR/DELETE/REVERT blocked if ANY lock exists
+- **Auto-release**: Locks released on WRITE_DONE or client disconnect
+- **Conflict handling**: Returns 423 (Locked) if lock acquisition fails
 
+### Undo System
+- **Snapshots**: Taken before WRITE, CLEAR, REVERT operations
+- **Storage**: `ss_data/.undo/<filename>/<N>.bak` (numbered sequentially)
+- **Single-level**: UNDO restores the most recent snapshot only
+- **Preservation**: Undo history persists across server restarts
+
+### Trash Bin
+- **Location**: `ss_data/.trash/<owner>/` per-owner subdirectories
+- **Behavior**: DELETE moves files instead of removing them
+- **Recovery**: RECOVER can restore with original or new name
+- **Visibility**: Trashed files excluded from VIEW/INFO listings
+
+## Commands Reference
+
+### CREATE - File Creation
+
+**Syntax**: `CREATE <filename>`
+
+**Implementation**:
+1. Client sends CREATE request to Name Server with authenticated username
+2. Name Server selects a Storage Server (round-robin/first-available)
+3. Storage Server validates filename (alphanumeric, `-`, `_`, `.` only; max 256 chars)
+4. Creates empty content file: `ss_data/<filename>`
+5. Creates metadata file: `ss_data/<filename>.meta` with:
+   - `owner:<username>`
+   - `created:<timestamp>`
+   - `updated:<timestamp>`
+   - `readers:` (empty)
+   - `writers:` (empty)
+6. Name Server updates registry cache with new file mapping
+
+**Access Requirements**: Any authenticated user (becomes owner)
+
+**Error Cases**:
+- 409 Conflict: File already exists
+- 400 Bad Request: Invalid filename (special chars, path traversal, empty)
+- 503 Service Unavailable: No Storage Server available
+
+**Assumptions**:
+- Filenames are case-sensitive
+- No nested directories (flat namespace)
+- File ownership is permanent
+
+---
+
+### DELETE - Move to Trash
+
+**Syntax**: `DELETE <filename>`
+
+**Implementation**:
+1. Client sends DELETE request through Name Server
+2. Name Server routes to owning Storage Server
+3. Storage Server checks for active sentence locks (fails with 423 if any exist)
+4. Validates requester is owner (only owner can delete)
+5. Reads owner from `.meta` file
+6. Creates trash directory: `ss_data/.trash/<owner>/` (if not exists)
+7. Atomically moves both files:
+   - `ss_data/<filename>` → `ss_data/.trash/<owner>/<filename>`
+   - `ss_data/<filename>.meta` → `ss_data/.trash/<owner>/<filename>.meta`
+8. Name Server removes file from registry cache
+
+**Access Requirements**: Owner only
+
+**Error Cases**:
+- 403 Forbidden: Non-owner attempting delete
+- 404 Not Found: File doesn't exist
+- 423 Locked: Active write lock on any sentence
+
+**Assumptions**:
+- DELETE is recoverable via RECOVER command
+- Trash is per-owner (users cannot access others' trash)
+- If file already exists in trash, it's overwritten
+
+---
+
+### CLEAR - Truncate File Content
+
+**Syntax**: `CLEAR <filename>`
+
+**Implementation**:
+1. Client sends CLEAR request through Name Server
+2. Storage Server validates write access (owner or writer)
+3. Checks for active sentence locks (fails with 423 if any exist)
+4. Takes undo snapshot: copies current content to `ss_data/.undo/<filename>/<N>.bak`
+5. Truncates file to zero bytes using `fopen(path, "w")`
+6. Updates metadata: `updated:<new_timestamp>`
+7. Preserves `accessed:` timestamp and ACL entries
+
+**Access Requirements**: Owner or writer
+
+**Error Cases**:
+- 403 Forbidden: No write access
+- 404 Not Found: File doesn't exist
+- 423 Locked: Active write lock exists
+
+**Assumptions**:
+- CLEAR is undoable (use UNDO to restore)
+- Metadata (owner, ACL) preserved
+- Empty file still exists after CLEAR
+
+---
+
+### READ - Display File Content
+
+**Syntax**: `READ <filename>`
+
+**Implementation**:
+1. Client queries Name Server for file location
+2. Name Server returns Storage Server IP and port (from registry cache)
+3. Client connects directly to Storage Server
+4. Storage Server validates read access:
+   - Owner → allowed
+   - Username in readers list → allowed
+   - Username in writers list → allowed (writer implies reader)
+   - Otherwise → 403 Forbidden
+5. Opens file and sends entire content as binary payload
+6. Updates `accessed:<timestamp>` in metadata
+7. Client displays content to stdout
+
+**Access Requirements**: Owner, reader, or writer
+
+**Error Cases**:
+- 403 Forbidden: No read access
+- 404 Not Found: File doesn't exist or not found in registry
+
+**Assumptions**:
+- File content sent as-is (preserves encoding, whitespace)
+- No size limit enforced (entire file loaded into memory)
+- READ doesn't require locking (concurrent reads allowed)
+
+---
+
+### WRITE - Interactive Sentence Editing
+
+**Syntax**: `WRITE <filename> <sentence_index>`
+
+**Implementation**:
+
+**Phase 1 - Lock Acquisition (WRITE_BEGIN)**:
+1. Client sends WRITE_BEGIN with filename and 0-based sentence index
+2. Storage Server validates write access (owner or writer)
+3. Parses file into sentences using delimiters (`.`, `!`, `?`)
+4. Checks if requested sentence exists (or allows append if index = sentence_count)
+5. Attempts to acquire lock on that sentence index:
+   - Checks global lock table (2048 slots) for conflicts
+   - If already locked by another client → 423 Locked
+   - If available → records lock (filename, sentence_index, client_socket)
+6. Returns success with current sentence content
+
+**Phase 2 - Interactive Editing**:
+7. Client displays current sentence split into words (1-based indexing)
+8. User enters replacements: `<word_number> <new_text>` (one per line)
+9. User types `ETIRW` when done editing
+
+**Phase 3 - Apply Changes (WRITE_FILE)**:
+10. Takes undo snapshot before modification
+11. Reconstructs sentence with user replacements:
+    - Maintains original word positions
+    - Insertions allowed (appends new words at specified indices)
+    - Sentence delimiters (`.`, `!`, `?`) split words if inserted mid-word
+12. Rebuilds entire file with modified sentence
+13. Writes updated content atomically
+14. Updates metadata: `updated:<timestamp>`
+15. Sends success response
+
+**Phase 4 - Lock Release (WRITE_DONE)**:
+16. Client sends WRITE_DONE
+17. Storage Server removes lock from table
+18. Lock also auto-released if client disconnects
+
+**Access Requirements**: Owner or writer
+
+**Error Cases**:
+- 403 Forbidden: No write access
+- 404 Not Found: File doesn't exist
+- 423 Locked: Sentence already locked by another client
+- 400 Bad Request: Invalid sentence index (beyond file length + 1)
+
+**Assumptions**:
+- Sentences parsed by `.`, `!`, `?` followed by whitespace or EOF
+- Word numbering is 1-based for user convenience (internally 0-based)
+- Appending allowed: sentence_index == total_sentences creates new sentence
+- Multiple delimiters in replacement text create multiple sentences
+- Locks held until explicit WRITE_DONE or disconnect
+- Concurrent writes to different sentences allowed
+
+---
+
+### VIEW - List Files
+
+**Syntax**: `VIEW [-a] [-l] [-al]`
+
+**Flags**:
+- (no flags): List files you can access (own, reader, writer)
+- `-a`: List all files in the system
+- `-l`: Long format (includes owner, size, word count, char count, timestamps)
+- `-al`: All files with long format
+
+**Implementation**:
+1. Client sends VIEW request to Name Server with flags
+2. Name Server checks registry cache:
+   - If empty or stale → refreshes from all Storage Servers via CMD_SS_LIST_FILES
+   - Otherwise → serves from cache (O(1) lookup via hash index)
+3. For each file, filters by access:
+   - Without `-a`: Include only if user is owner/reader/writer
+   - With `-a`: Include all files
+4. For long listing (`-l`):
+   - Retrieves cached metadata (owner, size, timestamps, ACL)
+   - Only refreshes from SS if cache entry is completely empty
+   - Formats: `filename\towner:X\tsize:Y\twords:Z\tchars:W\tlast_access:...\tlast_modified:...`
+5. Returns newline-separated file list
+
+**Access Requirements**: Any authenticated user
+
+**Performance Optimizations**:
+- **Smart caching**: Only refreshes metadata on cache miss, not on every VIEW
+- **Hash-based registry**: O(1) file lookup using FNV-1a hash (4096 buckets)
+- **Lazy refresh**: VIEW without flags doesn't trigger SS queries if cache populated
+- **Parallel SS queries**: When refresh needed, queries all SS concurrently
+
+**Error Cases**: None (returns empty list if no accessible files)
+
+**Assumptions**:
+- Cache updated on CREATE/DELETE/INFO operations
+- Trashed files excluded from VIEW results
+- Timestamps shown in both human-readable and Unix epoch formats
+
+---
+
+### INFO - Detailed File Metadata
+
+**Syntax**: `INFO <filename>`
+
+**Implementation**:
+1. Client sends INFO request to Name Server
+2. Name Server looks up file in registry (O(1) hash lookup)
+3. If not in cache → refreshes from all Storage Servers
+4. Routes request to owning Storage Server
+5. Storage Server:
+   - Validates access (owner, reader, or writer)
+   - Reads `.meta` file for: owner, created, updated, accessed, readers, writers
+   - Stats file using `stat()` for: size_bytes
+   - Reads content and computes:
+     - `words_cnt`: Tokens split by whitespace
+     - `chars_cnt`: Total characters
+   - Formats response with all fields
+6. Name Server caches result and forwards to client
+
+**Access Requirements**: Owner, reader, or writer
+
+**Output Format**:
 ```
-CREATE <filename>           # Owner-only initially; creates empty file and .meta
-DELETE <filename>           # Owner or writer; moves file to owner’s Trash (recoverable)
-CLEAR  <filename>           # Owner or writer; truncate content to empty (undoable)
+filename: <name>
+owner: <username>
+created: YYYY-MM-DD HH:MM:SS (<unix_timestamp>)
+updated: YYYY-MM-DD HH:MM:SS (<unix_timestamp>)
+size: <bytes>
+words: <count>
+chars: <count>
+last_access: YYYY-MM-DD HH:MM:SS (<unix_timestamp>)
+last_modified: YYYY-MM-DD HH:MM:SS (<unix_timestamp>)
+readers: <comma_separated_usernames>
+writers: <comma_separated_usernames>
 ```
 
-Notes
-- DELETE and CLEAR are blocked by active write locks (423).
-- CLEAR takes an undo snapshot first; UNDO restores the pre-clear content. `updated:` is refreshed.
+**Error Cases**:
+- 403 Forbidden: No access to file
+- 404 Not Found: File doesn't exist
 
-### Read / Write
+**Assumptions**:
+- `last_access` = most recent `accessed:` timestamp from metadata
+- `last_modified` = `updated:` timestamp from metadata
+- Words counted by whitespace tokenization
+- Empty ACL lists displayed as empty line
 
+---
+
+### ADDACCESS - Grant Access
+
+**Syntax**: `ADDACCESS -R|-W <filename> <username>`
+
+**Flags**:
+- `-R`: Grant read access only
+- `-W`: Grant write access (automatically includes read access)
+
+**Implementation**:
+1. Client sends ADDACCESS through Name Server
+2. Name Server validates target user exists:
+   - Checks `historical_users` array (tracks all ever-registered users)
+   - Returns 404 if target user never registered
+3. Routes to owning Storage Server
+4. Storage Server:
+   - Validates requester is owner (403 if not)
+   - Reads current `.meta` file
+   - For `-R`: Adds username to `readers:` list (if not already present)
+   - For `-W`: Adds username to both `writers:` and `readers:` lists
+   - Checks for duplicates (returns 409 if already has that access)
+   - Rewrites `.meta` file with updated ACL
+5. Name Server updates cached metadata
+
+**Access Requirements**: Owner only
+
+**Error Cases**:
+- 403 Forbidden: Non-owner attempting to modify ACL
+- 404 Not Found: File doesn't exist OR target user never registered
+- 409 Conflict: User already has requested access level
+
+**Assumptions**:
+- Writer access implies reader access (enforced at grant time)
+- ACL stored as comma-separated lists in metadata
+- No limit on number of readers/writers
+- Cannot grant access to non-existent users (validated by Name Server)
+
+---
+
+### REMACCESS - Remove Access
+
+**Syntax**: `REMACCESS <filename> <username>` or `REMACCESS -R|-W <filename> <username>`
+
+**Implementation**:
+1. Client sends REMACCESS through Name Server (flag optional, ignored)
+2. Routes to owning Storage Server
+3. Storage Server:
+   - Validates requester is owner (403 if not)
+   - Reads current `.meta` file
+   - Removes username from BOTH `readers:` and `writers:` lists
+   - Returns 404 if username not found in either list
+   - Rewrites `.meta` file
+4. Name Server updates cached metadata
+
+**Access Requirements**: Owner only
+
+**Error Cases**:
+- 403 Forbidden: Non-owner attempting removal
+- 404 Not Found: File doesn't exist OR user not in ACL
+- 404 Not Found: Attempting to remove owner (owner cannot be removed)
+
+**Assumptions**:
+- Removal is role-agnostic (removes from both lists regardless of flag)
+- Owner cannot be removed from their own file
+- Client accepts optional `-R|-W` flag for consistency but server ignores it
+
+---
+
+### CHECKPOINT - Create Named Snapshot
+
+**Syntax**: `CHECKPOINT <filename> <tag>`
+
+**Implementation**:
+1. Client sends CHECKPOINT request through Name Server
+2. Storage Server:
+   - Validates write access (owner or writer)
+   - Checks for active sentence locks (fails with 423 if any exist)
+   - Validates tag format: 1-64 chars, [A-Za-z0-9_-] only
+   - Creates checkpoint directory: `ss_data/.checkpoints/<filename>/` (if needed)
+   - Checks if tag already exists (409 if duplicate)
+   - Copies entire file content to: `ss_data/.checkpoints/<filename>/<tag>`
+   - Does NOT update metadata timestamps
+
+**Access Requirements**: Owner or writer
+
+**Error Cases**:
+- 403 Forbidden: No write access
+- 404 Not Found: File doesn't exist
+- 409 Conflict: Tag already exists
+- 423 Locked: Active write lock exists
+- 400 Bad Request: Invalid tag format
+
+**Assumptions**:
+- Checkpoints are immutable (cannot overwrite existing tag)
+- No limit on number of checkpoints per file
+- Checkpoints persist across server restarts
+- Checkpoint content is full file snapshot (not differential)
+
+---
+
+### LISTCHECKPOINTS - List All Tags
+
+**Syntax**: `LISTCHECKPOINTS <filename>`
+
+**Implementation**:
+1. Storage Server validates read access
+2. Reads directory: `ss_data/.checkpoints/<filename>/`
+3. Returns newline-separated list of tag names
+4. Empty response if no checkpoints exist
+
+**Access Requirements**: Owner, reader, or writer
+
+**Error Cases**:
+- 403 Forbidden: No read access
+- 404 Not Found: File doesn't exist
+
+---
+
+### VIEWCHECKPOINT - Display Checkpoint Content
+
+**Syntax**: `VIEWCHECKPOINT <filename> <tag>`
+
+**Implementation**:
+1. Storage Server validates read access
+2. Reads file: `ss_data/.checkpoints/<filename>/<tag>`
+3. Sends raw content as binary payload
+4. Client displays to stdout
+
+**Access Requirements**: Owner, reader, or writer
+
+**Error Cases**:
+- 403 Forbidden: No read access
+- 404 Not Found: File or checkpoint doesn't exist
+
+---
+
+### REVERT - Restore from Checkpoint
+
+**Syntax**: `REVERT <filename> <tag>`
+
+**Implementation**:
+1. Storage Server validates write access (owner or writer)
+2. Checks for active sentence locks (fails with 423 if any exist)
+3. Takes undo snapshot of current content (before overwriting)
+4. Reads checkpoint content from: `ss_data/.checkpoints/<filename>/<tag>`
+5. Overwrites current file content: `ss_data/<filename>`
+6. Updates metadata: `updated:<timestamp>`
+7. Preserves: owner, ACL, accessed timestamp
+
+**Access Requirements**: Owner or writer
+
+**Error Cases**:
+- 403 Forbidden: No write access
+- 404 Not Found: File or checkpoint doesn't exist
+- 423 Locked: Active write lock exists
+
+**Assumptions**:
+- REVERT is undoable (undo snapshot taken before revert)
+- Does NOT delete the checkpoint after reverting
+- Checkpoint content replaces entire file (not merged)
+
+---
+
+### TRASH - List Trashed Files
+
+**Syntax**: `TRASH`
+
+**Implementation**:
+1. Name Server broadcasts TRASH_LIST to all Storage Servers
+2. Each Storage Server:
+   - Reads directory: `ss_data/.trash/<authenticated_user>/`
+   - Returns newline-separated list of filenames
+3. Name Server aggregates results from all servers
+4. Client displays combined list
+
+**Access Requirements**: Any authenticated user (sees only their own trash)
+
+**Error Cases**: None (returns empty if trash is empty)
+
+**Assumptions**:
+- Trash is per-owner (isolated by username)
+- Trashed files retain original filename
+- If same filename deleted multiple times, latest delete overwrites previous
+
+---
+
+### RECOVER - Restore from Trash
+
+**Syntax**: `RECOVER <filename>` or `RECOVER <filename> <newname>`
+
+**Implementation**:
+1. Name Server queries all Storage Servers for trashed file
+2. First Storage Server with matching file in `ss_data/.trash/<user>/` handles recovery:
+   - Validates target name not in use (409 if exists)
+   - Uses `newname` if provided, otherwise uses original filename
+   - Atomically moves both files:
+     - `ss_data/.trash/<user>/<filename>` → `ss_data/<newname>`
+     - `ss_data/.trash/<user>/<filename>.meta` → `ss_data/<newname>.meta`
+3. Name Server adds recovered file to registry cache
+4. Storage Server refreshes metadata for new file
+
+**Access Requirements**: Owner only (implicitly enforced by trash directory structure)
+
+**Error Cases**:
+- 404 Not Found: File not in any trash bin
+- 409 Conflict: Target filename already exists
+
+**Assumptions**:
+- Recovered files retain original owner and ACL
+- Can rename during recovery to avoid conflicts
+- Recovery is atomic (both content and metadata moved together)
+
+---
+
+### EMPTYTRASH - Permanently Delete
+
+**Syntax**: `EMPTYTRASH -all` or `EMPTYTRASH <filename>`
+
+**Implementation**:
+
+**For `-all` flag**:
+1. Name Server broadcasts EMPTYTRASH to all Storage Servers
+2. Each Storage Server:
+   - Recursively removes: `ss_data/.trash/<authenticated_user>/`
+   - Recreates empty directory for future use
+3. Returns success if any server had items to remove
+
+**For specific filename**:
+1. Name Server queries all Storage Servers
+2. First server with matching file permanently removes:
+   - `ss_data/.trash/<user>/<filename>`
+   - `ss_data/.trash/<user>/<filename>.meta`
+
+**Access Requirements**: Owner only (trash directory enforces isolation)
+
+**Error Cases**:
+- 404 Not Found: Specified file not in trash (for single-file mode)
+
+**Assumptions**:
+- EMPTYTRASH is irreversible (no undo)
+- `-all` removes everything, regardless of when deleted
+- Single-file mode useful for selective cleanup
+
+---
+
+### STREAM - Live File Streaming
+
+**Syntax**: `STREAM <filename>`
+
+**Implementation**:
+1. Client queries Name Server for file location (like READ)
+2. Client connects directly to Storage Server
+3. Storage Server validates read access (owner/reader/writer)
+4. Gets file size via `stat()`
+5. Sends `CMD_ACK` header with `payload_size = file_size_bytes`
+6. Streams file word-by-word with delays:
+   - Reads character-by-character
+   - Accumulates word until whitespace encountered
+   - Sends word + trailing whitespace
+   - Sleeps 100ms between words (simulates streaming delay)
+7. Updates `accessed:<timestamp>` in metadata
+8. Client reads exactly `payload_size` bytes and displays in real-time
+
+**Access Requirements**: Owner, reader, or writer
+
+**Protocol Design**:
+- **Size-prefixed protocol**: Client knows exact byte count to expect
+- **No sentinel collision**: No special "STOP" marker needed (avoids issues if "STOP" appears in content)
+- **Unbuffered stdout**: Client uses `setvbuf(stdout, NULL, _IONBF, 0)` for live display
+- **Word-level granularity**: Entire words sent atomically with whitespace preserved
+
+**Error Cases**:
+- 403 Forbidden: No read access
+- 404 Not Found: File doesn't exist
+- Connection closed: If client disconnects mid-stream, server releases resources immediately
+
+**Assumptions**:
+- Stream is read-only (no locking required)
+- Whitespace preserved exactly as in file
+- 100ms delay per word is configurable (hardcoded for demo)
+- Concurrent streams to same file allowed
+
+---
+
+### EXEC - Execute File as Script
+
+**Syntax**: `EXEC <filename>`
+
+**Implementation**:
+1. Client sends EXEC request to Name Server (NOT Storage Server)
+2. Name Server:
+   - Resolves file location from registry
+   - Fetches file content from Storage Server using internal READ
+   - Validates requester has read access (owner/reader/writer)
+3. Name Server writes content to temporary file: `/tmp/nm_exec_XXXXXX`
+4. Executes via shell: `/bin/sh -s < /tmp/nm_exec_XXXXXX 2>&1`
+5. Captures stdout and stderr combined
+6. Sends output back to client as ACK payload
+7. Removes temporary file after execution
+
+**Access Requirements**: Owner, reader, or writer (same as READ)
+
+**Error Cases**:
+- 403 Forbidden: No read access
+- 404 Not Found: File doesn't exist
+- 500 Internal Error: mkstemp or popen failure
+
+**Assumptions**:
+- Script executed with `/bin/sh` (POSIX shell)
+- Output captured after full execution (not streamed)
+- Return code not reported (only stdout/stderr)
+- No timeout mechanism (long-running scripts block)
+
+---
+
+### LIST - Show All Registered Users
+
+**Syntax**: `LIST`
+
+**Implementation**:
+1. Name Server maintains `historical_users` array (tracks all ever-connected users)
+2. When client registers (CMD_REGISTER_CLIENT):
+   - Username added to array if not present
+   - Array persists for lifetime of Name Server process
+3. LIST returns newline-separated list of all usernames ever registered
+
+**Access Requirements**: Any authenticated user
+
+**Error Cases**: None
+
+**Assumptions**:
+- Historical tracking (includes disconnected users)
+- No user removal mechanism
+- Array limited to 1024 users (MAX_HISTORICAL_USERS)
+- Order not guaranteed
+
+---
+
+### UNDO - Restore Previous Version
+
+**Syntax**: `UNDO <filename>`
+
+**Implementation**:
+1. Client sends UNDO through Name Server
+2. Storage Server:
+   - Validates write access (owner or writer)
+   - Reads undo directory: `ss_data/.undo/<filename>/`
+   - Finds highest numbered snapshot: `<N>.bak`
+   - Returns 404 if no undo history exists
+3. Copies snapshot content to current file: `ss_data/<filename>`
+4. Updates metadata: `updated:<timestamp>`
+5. Preserves: owner, ACL, accessed timestamp
+6. Deletes used snapshot file (single-level undo)
+
+**Access Requirements**: Owner or writer
+
+**Error Cases**:
+- 403 Forbidden: No write access
+- 404 Not Found: File doesn't exist or no undo history
+
+**Assumptions**:
+- Single-level undo only (most recent snapshot)
+- Snapshot consumed after UNDO (cannot undo same change twice)
+- UNDO itself does NOT create new snapshot
+- Undo history persists across server restarts
+
+---
+
+## Error Codes
+
+| Code | Name | Usage |
+|------|------|-------|
+| 400 | Bad Request | Invalid filename, bad payload, malformed request |
+| 403 | Forbidden | Insufficient permissions (not owner/reader/writer) |
+| 404 | Not Found | File, checkpoint, user, or trash item doesn't exist |
+| 409 | Conflict | Duplicate creation (file/tag already exists) |
+| 423 | Locked | Operation blocked by active sentence lock |
+| 500 | Internal Error | Server-side failure (I/O error, malloc failure) |
+| 502 | Bad Gateway | Name Server cannot contact Storage Server |
+| 503 | Service Unavailable | No Storage Server registered |
+
+---
+
+## Technical Implementation Details
+
+### Protocol Design
+- **Binary framing**: Every message has `MsgHeader {CommandCode, int payload_size}`
+- **Size-prefixed payloads**: Eliminates need for sentinels or escape sequences
+- **No sentinel collision**: STREAM uses exact byte count, not "STOP" marker
+- **Direct SS connections**: Client connects to Storage Server directly for READ/WRITE/STREAM (reduces Name Server load)
+
+### Performance Optimizations
+- **O(1) file lookup**: FNV-1a hash map with 4096 buckets in Name Server registry
+- **Smart caching**: Metadata refreshed only on cache miss, not on every VIEW
+- **Lazy evaluation**: VIEW doesn't query Storage Servers if cache is warm
+- **Concurrent operations**: Multiple readers allowed; writes to different sentences can proceed in parallel
+
+### Concurrency Control
+- **Sentence-level locking**: 2048 lock slots allow fine-grained parallelism
+- **Per-SS serialization**: `ss_io_mutex` prevents interleaved Name Server ↔ Storage Server messages
+- **Auto-cleanup**: Locks released on client disconnect via connection tracking
+- **Lock-free reads**: No locking required for READ/STREAM/INFO operations
+
+### File Storage Layout
 ```
-READ  <filename>            # Print file content (requires read access)
-WRITE <filename> <sentence> # Interactive replace/append at 0-based sentence index
+ss_data/
+├── <filename>                    # Content files (flat namespace)
+├── <filename>.meta               # Metadata (owner, ACL, timestamps)
+├── .undo/
+│   └── <filename>/
+│       └── <N>.bak               # Undo snapshots (numbered sequentially)
+├── .trash/
+│   └── <owner>/
+│       ├── <filename>            # Deleted content
+│       └── <filename>.meta       # Deleted metadata
+└── .checkpoints/
+    └── <filename>/
+        └── <tag>                 # Tagged snapshots
 ```
 
-Notes
-- WRITE acquires a sentence lock, fetches content, shows words for that sentence, and lets you edit until you type `ETIRW`.
-- On success, metadata `updated:` is refreshed; undo snapshot is stored.
+### Assumptions and Limitations
+1. **Flat namespace**: No nested directories, all files at root level
+2. **Filename restrictions**: Alphanumeric, `-`, `_`, `.` only; max 256 chars
+3. **Single Name Server**: No NM replication or failover
+4. **Single-level undo**: Only most recent change can be undone
+5. **In-memory registry**: File mappings lost on NM restart (rebuilt from SS)
+6. **No authentication**: Username is self-declared, no password verification
+7. **No encryption**: All data transmitted in plaintext
+8. **No quota limits**: Users can create unlimited files
+9. **Fixed buffer sizes**: 16KB for file lists, 2048 bytes for sentence replacements
+10. **POSIX dependency**: Uses Linux-specific system calls (not fully portable to Windows)
 
-### Listing and Info
+---
 
-```
-VIEW [-a|-l|-al]            # List files; -a all, -l long (details)
-INFO <filename>             # Show detailed metadata and computed stats
-```
+## Usage Examples
 
-Notes
-- VIEW/INFO values are refreshed from the Storage Server on demand.
-- INFO shows owner, readers, writers, size/words/chars, last_access, last_modified.
-
-### Access Control (direct)
-
-```
-ADDACCESS -R|-W <filename> <user>  # Grant read or write (writer implies reader)
-REMACCESS        <filename> <user>  # Remove any access for the user
-```
-
-Rules
-- Only the owner can modify ACLs. Granting -W automatically adds the user to readers.
-
-### Access Requests (workflow)
-
-```
-REQUESTACCESS -R|-W <filename>     # Ask owner for access
-LISTREQUESTS <filename>            # Owner: list pending requests
-APPROVEREQUEST -R|-W <filename> <user>
-DENYREQUEST        <filename> <user>
-```
-
-Notes
-- Anyone can request on existing files; owner approves/denies. On approval, ACL updates accordingly.
-
-### Checkpoints (snapshots)
-
-The system supports persistent, tagged checkpoints of the entire file.
-
-```
-CHECKPOINT <filename> <tag>        # Owner or writer
-LISTCHECKPOINTS <filename>         # Any reader
-VIEWCHECKPOINT <filename> <tag>    # Any reader
-REVERT <filename> <tag>            # Owner or writer; blocked by active locks
-```
-
-Rules and Errors
-- Tags: 1–64 chars [A-Za-z0-9_-]. Existing tag → 409. Missing/unauthorized → 404/403. Active lock → 423.
-- Reverting updates `updated:` in metadata. Tags are stored under `ss_data/.checkpoints/<file>/<tag>`.
-
-### Trash Bin (recoverable deletes)
-
-```
-TRASH                          # List your trashed files (owner only)
-RECOVER <filename> [newname]   # Restore from your trash; optionally rename
-EMPTYTRASH [-all | <filename>] # Permanently remove all or one item from trash
-```
-
-Notes
-- DELETE moves content and .meta to `ss_data/.trash/<owner>/`. VIEW/INFO ignore `.trash`.
-- RECOVER fails if the target name exists; pass `newname` to restore under a different name.
-
-### Streaming and Exec
-
-```
-STREAM <filename>             # Live stream raw file bytes; server first ACKs with total size
-EXEC   <filename>             # Run file content via /bin/sh on the Name Server; returns output
-```
-
-Notes
-- STREAM prints content as it streams; when the announced number of bytes are received, the prompt continues on a new line.
-- EXEC requires read access; use with caution—runs on the Name Server host.
-
-### Users
-
-```
-LIST                          # Show currently registered users
-```
-
-### Undo
-
-```
-UNDO <filename>               # Restore last snapshot (from WRITE, CLEAR, REVERT, etc.)
-```
-
-Notes
-- UNDO updates `updated:` in metadata while preserving `accessed`, readers, and writers.
-
-## Error Codes (representative)
-
-| Scenario                                  | Code | Message (typical)                |
-|-------------------------------------------|------|----------------------------------|
-| Unauthorized (no required ACL)            | 403  | Read/Write access denied         |
-| Missing file/checkpoint                   | 404  | File not found / Checkpoint missing |
-| Name conflict / Already exists            | 409  | Tag exists / File exists         |
-| Operation blocked by active write locks   | 423  | Active write lock                |
-
-## Implementation Notes
-
-- Storage Root: `ss_data/` (override by defining STORAGE_ROOT at compile time if desired).
-- Metadata policy: `last_access` and `last_modified` are computed using meta fields; `updated:` changes on content edits, UNDO, and REVERT; `accessed:` is updated on reads/streams.
-- Writer implies reader: granting write automatically grants read; INFO and VIEW reflect this.
-- Sentence locking: WRITE operates on 0-based sentence indices parsed by [.!?] separators; whitespace after punctuation belongs to the sentence.
-- STREAM protocol: client sends a `CMD_STREAM` request; SS responds with `CMD_ACK` whose `payload_size` equals the total byte length of the file, then streams exactly that many bytes. This avoids any sentinel-collision issues.
-
-## Examples
-
-```
+### Basic Workflow
+```bash
+# Alice creates and edits a file
 alice> CREATE report.txt
+[Client] File 'report.txt' created.
+
 alice> WRITE report.txt 0
-[Client] Current sentence words (1-based):
-...
-alice> CHECKPOINT report.txt draft1
-alice> VIEW -l
-...
-alice> CLEAR report.txt
-alice> UNDO report.txt
+[Client] Sentence 0 has 0 words. Enter replacements or append (e.g., "1 text"), then type ETIRW:
+1 This
+2 is
+3 my
+4 report.
+ETIRW
+[Client] WRITE applied.
+
+alice> READ report.txt
+This is my report.
+
+# Grant access to Bob
+alice> ADDACCESS -R report.txt bob
+[Client] Access added.
+
+# Bob can now read
+bob> READ report.txt
+This is my report.
+```
+
+### Collaborative Editing
+```bash
+# Alice writes sentence 0, Bob writes sentence 1 (concurrent)
+alice> WRITE report.txt 0
+1 Introduction:
+2 This
+3 document
+4 covers.
+ETIRW
+
+bob> WRITE report.txt 1
+1 We
+2 will
+3 discuss
+4 the
+5 findings.
+ETIRW
+
+alice> READ report.txt
+Introduction: This document covers. We will discuss the findings.
+```
+
+### Checkpoint and Recovery
+```bash
+alice> CHECKPOINT report.txt v1
+[Client] Checkpoint created.
+
+alice> WRITE report.txt 0
+[... makes changes ...]
+
+alice> LISTCHECKPOINTS report.txt
+v1
+
+alice> REVERT report.txt v1
+[Client] File reverted to checkpoint 'v1'.
+```
+
+### Trash and Recovery
+```bash
 alice> DELETE report.txt
+[Client] File 'report.txt' deleted.
+
 alice> TRASH
 report.txt
+
 alice> RECOVER report.txt
+[Client] File recovered.
+
+alice> EMPTYTRASH -all
+[Client] Trash emptied.
 ```
 
 ---
 
-## Checkpoint Feature
+## Building and Testing
 
-The system now supports persistent, tagged checkpoints for file contents. A checkpoint is an immutable snapshot of the full file content captured at a point in time. You can create multiple checkpoints for a file, list them, inspect their content, and revert the file back to any named checkpoint.
-
-### Commands (Client CLI)
-
-```
-CHECKPOINT <filename> <tag>        # Create a checkpoint (owner or writer).
-LISTCHECKPOINTS <filename>         # List all checkpoint tags (any user with read access).
-VIEWCHECKPOINT <filename> <tag>    # Show the content stored in a specific checkpoint (read access).
-REVERT <filename> <tag>            # Replace current file content with that checkpoint (owner or writer, no active write locks).
+### Build Commands
+```bash
+make              # Build all binaries
+make clean        # Remove binaries and object files
 ```
 
-### Notes & Rules
-
-* Tags must be 1–64 chars using only: letters, digits, '-' or '_'.
-* Creating or reverting is blocked if any sentence write lock is active on that file.
-* Reverting updates the file's `updated:` timestamp in metadata.
-* Listing returns newline-separated tags; viewing returns raw file bytes.
-* Attempting to create a checkpoint with an existing tag returns an error (409).
-
-### Error Cases (Representative)
-
-| Scenario | Error Code | Message |
-|----------|------------|---------|
-| Tag already exists | 409 | Tag exists |
-| Unauthorized action | 403 | Write access denied / Unauthorized |
-| File or checkpoint missing | 404 | File not found / Checkpoint not found |
-| Active sentence locks block create/revert | 423 | Active write lock |
-
-### Internals
-
-Checkpoints are stored under: `ss_data/.checkpoints/<filename>/<tag>` on the Storage Server.
-
-### Examples
-
-```
-alice> CHECKPOINT report.txt draft1
-alice> LISTCHECKPOINTS report.txt
-draft1
-alice> VIEWCHECKPOINT report.txt draft1
-<contents printed>
-alice> REVERT report.txt draft1
+### Running Tests
+```bash
+./test.sh         # Automated test suite (requires WSL/bash)
 ```
 
-## Access Requests
-
-Users can request access to files they don’t own. Owners can list and approve or deny requests.
-
-### Commands (Client CLI)
-
-```
-REQUESTACCESS -R|-W <filename>         # Request read (-R) or write (-W) access for yourself.
-LISTREQUESTS <filename>                # List pending requests for a file you own.
-APPROVEREQUEST -R|-W <filename> <user> # Approve a user's request (choose access level to grant).
-DENYREQUEST <filename> <user>          # Deny and remove a user's request.
-```
-
-### Notes & Rules
-
-* Anyone may submit a request on an existing file; it fails if you already have that access or a pending request exists.
-* Only the owner can list or respond to requests.
-* On approval, the user's name is added to readers (for -R) or writers (for -W). On denial, nothing changes.
-* Pending requests are removed after approval or denial.
-* Storage layout: requests live under `ss_data/.requests/<filename>/<requester>.req` with content `READ` or `WRITE`.
-
-### Examples
-
-```
-alice> LISTREQUESTS report.txt
-(no output when empty)
-bob> REQUESTACCESS -R report.txt
-alice> LISTREQUESTS report.txt
-bob	READ
-alice> APPROVEREQUEST -R report.txt bob
-bob> READ report.txt   # now allowed
-```
-
-## Trash Bin (Recoverable Deletions)
-
-Deleted files are now moved to a per-owner Trash on the Storage Server instead of being permanently removed. You can list trashed files, recover them, or empty the trash.
-
-### Commands (Client CLI)
-
-```
-TRASH                          # List your trashed files across all Storage Servers
-RECOVER <filename> [newname]   # Recover a file from your trash; optionally rename on restore
-EMPTYTRASH [-all | <filename>] # Permanently remove all trashed files, or a specific file
-```
-
-### Notes & Rules
-
-* Only the owner can view or manage their own trash; the Name Server enforces this.
-* On DELETE, the Storage Server moves both the content and its .meta into `ss_data/.trash/<owner>/`.
-* RECOVER fails if a file of the same name already exists; supply `newname` to restore under a different name.
-* VIEW/INFO listings exclude `.trash` entirely.
-* EMPTYTRASH -all broadcasts to all Storage Servers and removes all your trashed items.
-
-### Examples
-
-```
-alice> DELETE report.txt          # moves to trash
-alice> TRASH
-report.txt
-alice> RECOVER report.txt         # restores as report.txt (if free)
-alice> RECOVER notes.txt new.txt  # restore under a new name
-alice> EMPTYTRASH -all            # purge any remaining trashed items
-```
+The test suite covers:
+- File creation and deletion
+- Read/write operations with access control
+- Concurrent operations and locking
+- Checkpoints and undo
+- Trash bin operations
+- EXEC and STREAM functionality
+- Error handling and edge cases
