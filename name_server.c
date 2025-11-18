@@ -56,6 +56,21 @@ static char historical_users[MAX_HISTORICAL_USERS][MAX_USERNAME_LEN];
 static int historical_user_count = 0;
 static pthread_mutex_t historical_users_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Returns 1 if username is present in historical_users, else 0
+static int is_user_registered(const char* username) {
+    if (!username || !*username) return 0;
+    int found = 0;
+    pthread_mutex_lock(&historical_users_mutex);
+    for (int i = 0; i < historical_user_count; i++) {
+        if (strncmp(historical_users[i], username, MAX_USERNAME_LEN) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&historical_users_mutex);
+    return found;
+}
+
 // --- FILE REGISTRY (maintained by NM) ---
 #define MAX_FILES 10000
 typedef struct {
@@ -530,57 +545,39 @@ void* handle_connection(void* arg) {
 
             char buffer[16384]; buffer[0] = '\0'; size_t pos = 0, cap = sizeof(buffer);
 
-            // Ensure ACL metadata is available before filtering for default VIEW (no -l, no -a)
+            // Only refresh metadata if cache is empty AND user needs ACL filtering (no -a flag)
+            // This avoids expensive per-file SS queries on every VIEW call
             if (!vreq.show_all && !vreq.long_list) {
-                typedef struct { char name[MAX_FILENAME_LEN]; int ss_slot; } FSel;
-                FSel tmp[1024]; int n_tmp = 0;
+                int any_missing = 0;
                 pthread_mutex_lock(&file_registry_mutex);
-                for (int i = 0; i < file_count && n_tmp < (int)(sizeof(tmp)/sizeof(tmp[0])); i++) {
-                    const char* fname = file_registry[i].filename;
-                    int ss_slot = file_registry[i].ss_slot;
-                    int need = 0;
-                    if (file_registry[i].owner[0] == '\0' || (file_registry[i].readers[0] == '\0' && file_registry[i].writers[0] == '\0')) {
-                        need = 1;
-                    }
-                    if (need) {
-                        strncpy(tmp[n_tmp].name, fname, MAX_FILENAME_LEN-1); tmp[n_tmp].name[MAX_FILENAME_LEN-1] = '\0';
-                        tmp[n_tmp].ss_slot = ss_slot;
-                        n_tmp++;
+                for (int i = 0; i < file_count; i++) {
+                    if (file_registry[i].owner[0] == '\0') {
+                        any_missing = 1;
+                        break;
                     }
                 }
                 pthread_mutex_unlock(&file_registry_mutex);
-                for (int i = 0; i < n_tmp; i++) {
-                    registry_update_one_from_ss(tmp[i].ss_slot, tmp[i].name);
+                // Only do full refresh if we have files with no owner info at all
+                if (any_missing) {
+                    registry_refresh_from_ss();
                 }
             }
 
-            // If long_list is requested, gather targets and refresh INFO per file for dynamic stats
+            // For long_list (-l flag), only refresh if cache is stale or empty
+            // Changed from: always refresh all files on every -l request
+            // Now: rely on cached metadata; refresh only on explicit cache miss
             if (vreq.long_list) {
-                // Snapshot current files to consider (name + ss_slot) honoring access filter
-                typedef struct { char name[MAX_FILENAME_LEN]; int ss_slot; } ToRefresh;
-                ToRefresh tmp[1024]; int n_tmp = 0;
+                int need_refresh = 0;
                 pthread_mutex_lock(&file_registry_mutex);
-                for (int i = 0; i < file_count && n_tmp < (int)(sizeof(tmp)/sizeof(tmp[0])); i++) {
-                    const char* fname = file_registry[i].filename;
-                    const char* owner = file_registry[i].owner;
-                    const char* readers = file_registry[i].readers;
-                    const char* writers = file_registry[i].writers;
-                    int include_file = 1;
-                    if (!vreq.show_all) {
-                        include_file = 0;
-                        if (owner[0] && strncmp(owner, requester, MAX_USERNAME_LEN)==0) include_file = 1;
-                        else if (nm_list_contains(readers, requester)) include_file = 1;
-                        else if (nm_list_contains(writers, requester)) include_file = 1;
+                for (int i = 0; i < file_count; i++) {
+                    if (file_registry[i].size_bytes == 0 && file_registry[i].owner[0] == '\0') {
+                        need_refresh = 1;
+                        break;
                     }
-                    if (!include_file) continue;
-                    strncpy(tmp[n_tmp].name, fname, MAX_FILENAME_LEN-1); tmp[n_tmp].name[MAX_FILENAME_LEN-1]='\0';
-                    tmp[n_tmp].ss_slot = file_registry[i].ss_slot;
-                    n_tmp++;
                 }
                 pthread_mutex_unlock(&file_registry_mutex);
-                // Refresh each selected file from SS for dynamic stats
-                for (int i = 0; i < n_tmp; i++) {
-                    registry_update_one_from_ss(tmp[i].ss_slot, tmp[i].name);
+                if (need_refresh) {
+                    registry_refresh_from_ss();
                 }
             }
 
@@ -708,6 +705,13 @@ void* handle_connection(void* arg) {
                 continue;
             }
             LOG_NM("%s request file='%s' target='%s' by user='%s'\n", (header.command==CMD_ADD_ACCESS?"ADD_ACCESS":"REM_ACCESS"), req.filename, req.target, connections[slot].username);
+            // Validate that target user exists (per spec Q&A). Only enforced for ADDACCESS.
+            if (header.command == CMD_ADD_ACCESS) {
+                if (!is_user_registered(req.target)) {
+                    send_error(socket, 404, "Target user not registered");
+                    continue;
+                }
+            }
             // Find owning SS (cache-first; refresh on miss)
             int ss_slot = -1;
             int idx_acc = file_index_find(req.filename);

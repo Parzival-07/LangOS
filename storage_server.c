@@ -1040,10 +1040,17 @@ static void* handle_one_client(void* arg) {
                         return NULL;
                     }
                     char path[512]; snprintf(path, sizeof(path), STORAGE_ROOT "/%s", rq.filename);
+                    // Get file size first
+                    struct stat st;
+                    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) { send_error_to(client_socket, 404, "Not found"); close(client_socket); sentence_lock_release_all_for_owner(client_socket); return NULL; }
                     FILE* f = fopen(path, "rb"); if (!f) { send_error_to(client_socket, 404, "Not found"); close(client_socket); sentence_lock_release_all_for_owner(client_socket); return NULL; }
-                    // Stream word-by-word but preserve original whitespace and do not add extra '\n' per word.
-                    LOG_SS("[CLIENT %s:%d] STREAM start '%s'\n", peer_ip, peer_port, rq.filename);
-                    // We insert a 0.1s delay after sending each word (and its following whitespace) to simulate streaming.
+                    
+                    // Send ACK with total size so client knows how many bytes to expect
+                    MsgHeader ack = { .command = CMD_ACK, .payload_size = (int)st.st_size };
+                    LOG_SS("[CLIENT %s:%d] STREAM start '%s' size=%lld\n", peer_ip, peer_port, rq.filename, (long long)st.st_size);
+                    if (!send_all(client_socket, &ack, sizeof(ack))) { fclose(f); close(client_socket); sentence_lock_release_all_for_owner(client_socket); return NULL; }
+                    
+                    // Stream word-by-word with delays to simulate streaming
                     int c; int in_word = 0; char word[4096]; size_t wpos = 0;
                     while ((c = fgetc(f)) != EOF) {
                         int is_ws = (c==' '||c=='\n'||c=='\t'||c=='\r'||c=='\f'||c=='\v');
@@ -1053,7 +1060,7 @@ static void* handle_one_client(void* arg) {
                         } else {
                             if (in_word) {
                                 // end of a word: send the word, then the whitespace run, then delay
-                                if (wpos > 0) { (void)send_all(client_socket, word, wpos); }
+                                if (wpos > 0) { if (!send_all(client_socket, word, wpos)) { fclose(f); close(client_socket); sentence_lock_release_all_for_owner(client_socket); return NULL; } }
                                 // send this whitespace char and any subsequent whitespace chars as-is
                                 char ws[4096]; size_t wss = 0; ws[wss++] = (char)c;
                                 int c2;
@@ -1065,22 +1072,20 @@ static void* handle_one_client(void* arg) {
                                         break;
                                     }
                                 }
-                                if (wss > 0) (void)send_all(client_socket, ws, wss);
+                                if (wss > 0) { if (!send_all(client_socket, ws, wss)) { fclose(f); close(client_socket); sentence_lock_release_all_for_owner(client_socket); return NULL; } }
                                 usleep(100000);
                                 wpos = 0; in_word = 0;
                             } else {
                                 // outside a word: forward whitespace as-is
-                                char ch = (char)c; (void)send_all(client_socket, &ch, 1);
+                                char ch = (char)c; if (!send_all(client_socket, &ch, 1)) { fclose(f); close(client_socket); sentence_lock_release_all_for_owner(client_socket); return NULL; }
                             }
                         }
                     }
                     if (in_word && wpos > 0) {
-                        (void)send_all(client_socket, word, wpos);
+                        if (!send_all(client_socket, word, wpos)) { fclose(f); close(client_socket); sentence_lock_release_all_for_owner(client_socket); return NULL; }
                         usleep(100000);
                     }
                     fclose(f);
-                    // Signal end with a sentinel line the client can detect
-                    (void)send_all(client_socket, "STOP\n", 5);
                     LOG_SS("[CLIENT %s:%d] STREAM end '%s'\n", peer_ip, peer_port, rq.filename);
                     // Record access time in metadata (portable alternative to atime)
                     {
