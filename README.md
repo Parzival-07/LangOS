@@ -121,12 +121,12 @@ Notes
 ### Streaming and Exec
 
 ```
-STREAM <filename>             # Live stream raw file bytes; ends when server sends STOP
+STREAM <filename>             # Live stream raw file bytes; server first ACKs with total size
 EXEC   <filename>             # Run file content via /bin/sh on the Name Server; returns output
 ```
 
 Notes
-- STREAM prints content as it streams; after STOP, the prompt continues on a new line.
+- STREAM prints content as it streams; when the announced number of bytes are received, the prompt continues on a new line.
 - EXEC requires read access; use with caution—runs on the Name Server host.
 
 ### Users
@@ -159,7 +159,7 @@ Notes
 - Metadata policy: `last_access` and `last_modified` are computed using meta fields; `updated:` changes on content edits, UNDO, and REVERT; `accessed:` is updated on reads/streams.
 - Writer implies reader: granting write automatically grants read; INFO and VIEW reflect this.
 - Sentence locking: WRITE operates on 0-based sentence indices parsed by [.!?] separators; whitespace after punctuation belongs to the sentence.
-- STREAM protocol: client requests header, then SS streams raw bytes and terminates with `STOP\n`.
+- STREAM protocol: client sends a `CMD_STREAM` request; SS responds with `CMD_ACK` whose `payload_size` equals the total byte length of the file, then streams exactly that many bytes. This avoids any sentinel-collision issues.
 
 ## Examples
 

@@ -690,10 +690,24 @@ write_cancel_release:
             else if (rh.command == CMD_ERROR && rh.payload_size == sizeof(MsgError)) { MsgError err; recv_all(nm_socket, &err, sizeof(err)); printf("[Client] ADDACCESS failed (%d): %s\n", err.code, err.message); }
             else printf("[Client] Unexpected response (%d).\n", rh.command);
         } else if (strcmp(command, "REMACCESS") == 0) {
-            // Spec: REMACCESS <filename> <username>
-            char* fname = strtok(NULL, " ");
-            char* target = strtok(NULL, " ");
-            if (!fname || !target) { printf("[Client] Usage: REMACCESS <filename> <username>\n"); continue; }
+            // Accept both:
+            //   REMACCESS <filename> <username>
+            //   REMACCESS -R|-W <filename> <username>
+            // The flag is ignored on the server (removal is role-agnostic),
+            // but we parse it for user convenience to avoid mis-parsing filenames.
+            char* t1 = strtok(NULL, " ");
+            char* fname = NULL;
+            char* target = NULL;
+            if (!t1) { printf("[Client] Usage: REMACCESS [-R|-W] <filename> <username>\n"); continue; }
+            if (t1[0] == '-' && (strcasecmp(t1, "-R") == 0 || strcasecmp(t1, "-W") == 0)) {
+                fname = strtok(NULL, " ");
+                target = strtok(NULL, " ");
+            } else {
+                fname = t1;
+                target = strtok(NULL, " ");
+            }
+            if (!fname || !target) { printf("[Client] Usage: REMACCESS [-R|-W] <filename> <username>\n"); continue; }
+
             MsgAccessChange ac = (MsgAccessChange){0};
             strncpy(ac.filename, fname, MAX_FILENAME_LEN-1);
             strncpy(ac.target, target, MAX_USERNAME_LEN-1);
@@ -930,7 +944,8 @@ write_cancel_release:
             if (inet_pton(AF_INET, addr.ss_ip, &ss_addr.sin_addr) <= 0) { perror("[Client] inet_pton"); close(ss_fd); continue; }
             if (connect(ss_fd, (struct sockaddr*)&ss_addr, sizeof(ss_addr)) < 0) { perror("[Client] connect to SS"); close(ss_fd); continue; }
 
-            // Request streaming via CMD_STREAM and read raw bytes while detecting STOP\n sentinel.
+            // Request streaming via CMD_STREAM; SS replies with ACK(payload_size=total bytes).
+            // Read exactly that many bytes and print as they arrive.
             MsgStreamRequest sr = (MsgStreamRequest){0};
             strncpy(sr.filename, fname, MAX_FILENAME_LEN-1);
             strncpy(sr.requester, username, MAX_USERNAME_LEN-1);
@@ -940,58 +955,56 @@ write_cancel_release:
                 close(ss_fd);
                 continue;
             }
-            // Peek to see if SS immediately responded with an error header.
-            // On success, SS streams raw bytes without a header; on failure it sends CMD_ERROR + MsgError.
-            {
-                MsgHeader peek;
-                ssize_t got = recv(ss_fd, &peek, sizeof(peek), MSG_PEEK);
-                if (got == (ssize_t)sizeof(peek) && peek.command == CMD_ERROR && peek.payload_size == (int)sizeof(MsgError)) {
-                    // Consume the error header and payload fully and report a clean message
-                    MsgHeader eh; MsgError err;
-                    if (recv_all(ss_fd, &eh, sizeof(eh)) && recv_all(ss_fd, &err, sizeof(err))) {
-                        printf("STREAM failed (%d): %s\n", err.code, err.message);
-                    } else {
-                        printf("STREAM failed: unknown error from Storage Server\n");
-                    }
-                    close(ss_fd);
-                    continue;
-                }
+            // Read response header: ACK with size or ERROR
+            MsgHeader stream_hdr;
+            if (!recv_all(ss_fd, &stream_hdr, sizeof(stream_hdr))) {
+                LOGE_CLIENT("STREAM: no response header from SS\n");
+                close(ss_fd);
+                continue;
             }
-            // Rolling STOP detection ("STOP\n"), printing all other bytes immediately.
-            int got_stop = 0;
-            char hold[5]; int hlen = 0; // keep last up to 5 bytes to match STOP\n
+            
+            if (stream_hdr.command == CMD_ERROR && stream_hdr.payload_size == (int)sizeof(MsgError)) {
+                MsgError err;
+                if (recv_all(ss_fd, &err, sizeof(err))) {
+                    printf("STREAM failed (%d): %s\n", err.code, err.message);
+                } else {
+                    printf("STREAM failed: unknown error from Storage Server\n");
+                }
+                close(ss_fd);
+                continue;
+            }
+            
+            if (stream_hdr.command != CMD_ACK) {
+                printf("STREAM: unexpected response (%d)\n", stream_hdr.command);
+                close(ss_fd);
+                continue;
+            }
+            
+            // ACK payload_size tells us exactly how many bytes to read
+            size_t total_bytes = (size_t)stream_hdr.payload_size;
+            size_t received = 0;
+            
             // Unbuffer stdout to see live output
             setvbuf(stdout, NULL, _IONBF, 0);
-            char last_printed = '\n'; // track last printed char to decide whether to add a trailing newline
 
             char rbuf[1024];
-            while (!got_stop) {
-                ssize_t n = recv(ss_fd, rbuf, sizeof(rbuf), 0);
-                if (n <= 0) break;
-                for (ssize_t i = 0; i < n; ++i) {
-                    char ch = rbuf[i];
-                    if (hlen < 5) {
-                        hold[hlen++] = ch;
-                    } else {
-                        // print the oldest byte and shift
-                        fputc(hold[0], stdout);
-                        last_printed = hold[0];
-                        memmove(hold, hold+1, 4);
-                        hold[4] = ch;
-                    }
-                    if (hlen == 5 && memcmp(hold, "STOP\n", 5) == 0) {
-                        got_stop = 1;
-                        break;
-                    }
+            while (received < total_bytes) {
+                size_t to_read = total_bytes - received;
+                if (to_read > sizeof(rbuf)) to_read = sizeof(rbuf);
+                ssize_t n = recv(ss_fd, rbuf, to_read, 0);
+                if (n <= 0) {
+                    printf("\nError: Storage Server disconnected during streaming\n");
+                    break;
                 }
+                fwrite(rbuf, 1, (size_t)n, stdout);
+                received += (size_t)n;
             }
-            if (!got_stop) {
-                // flush any pending bytes
-                for (int i = 0; i < hlen; ++i) { fputc(hold[i], stdout); last_printed = hold[i]; }
-                printf("\nError: Storage Server disconnected during streaming\n");
-            } else {
-                // Stream ended with STOP sentinel. Ensure the prompt starts on a new line.
-                if (last_printed != '\n') fputc('\n', stdout);
+            
+            // Ensure output ends with newline for clean prompt
+            if (received > 0 && received == total_bytes) {
+                // Check if last char was newline; if not, add one
+                // (we'd need to track last byte, but simpler: always ensure newline)
+                fputc('\n', stdout);
             }
             // Restore stdout buffering to a sane default for the interactive prompt
             {
