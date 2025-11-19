@@ -545,23 +545,9 @@ void* handle_connection(void* arg) {
 
             char buffer[16384]; buffer[0] = '\0'; size_t pos = 0, cap = sizeof(buffer);
 
-            // Only refresh metadata if cache is empty AND user needs ACL filtering (no -a flag)
-            // This avoids expensive per-file SS queries on every VIEW call
-            if (!vreq.show_all && !vreq.long_list) {
-                int any_missing = 0;
-                pthread_mutex_lock(&file_registry_mutex);
-                for (int i = 0; i < file_count; i++) {
-                    if (file_registry[i].owner[0] == '\0') {
-                        any_missing = 1;
-                        break;
-                    }
-                }
-                pthread_mutex_unlock(&file_registry_mutex);
-                // Only do full refresh if we have files with no owner info at all
-                if (any_missing) {
-                    registry_refresh_from_ss();
-                }
-            }
+            // Don't preemptively refresh metadata for VIEW without -a flag
+            // Instead, fetch owner info on-demand only for files that pass initial checks
+            // This avoids expensive N*RTT overhead when there are many files
 
             // For long_list (-l flag), only refresh if cache is stale or empty
             // Changed from: always refresh all files on every -l request
@@ -591,6 +577,18 @@ void* handle_connection(void* arg) {
 
                 int include_file = 1;
                 if (!vreq.show_all) {
+                    // Lazy metadata fetch: only query SS if we don't have owner info yet
+                    if (owner[0] == '\0') {
+                        int ss_slot = file_registry[i].ss_slot;
+                        pthread_mutex_unlock(&file_registry_mutex);
+                        registry_update_one_from_ss(ss_slot, fname);
+                        pthread_mutex_lock(&file_registry_mutex);
+                        // Re-read potentially updated values
+                        owner = file_registry[i].owner;
+                        readers = file_registry[i].readers;
+                        writers = file_registry[i].writers;
+                    }
+                    
                     include_file = 0;
                     if (owner[0] && strncmp(owner, requester, MAX_USERNAME_LEN)==0) include_file = 1;
                     else if (nm_list_contains(readers, requester)) include_file = 1;

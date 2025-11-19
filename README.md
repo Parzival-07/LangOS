@@ -26,11 +26,35 @@ This project implements a distributed file collaboration system with three compo
 
 3) Start one or more Storage Servers (each needs a client port), e.g.
 	- ./storage_server 9001
+	- Or with custom Name Server IP: `./storage_server 9001 192.168.1.100`
 
 4) Start a Client in a separate terminal and enter a username when prompted
 	- ./client
+	- Or with custom Name Server IP: `./client 192.168.1.100`
 
 Order matters: start NM → SS → client. Each Storage Server registers itself with the Name Server.
+
+### Network Configuration
+
+By default, all components connect to Name Server at `127.0.0.1:8000` (localhost). To run across multiple machines:
+
+**Scenario: Friend hosts Name Server on IP `192.168.1.100`**
+```bash
+# On friend's laptop (192.168.1.100)
+./name_server
+
+# On your laptop - Storage Server
+./storage_server 9001 192.168.1.100
+
+# On your laptop - Client
+./client 192.168.1.100
+```
+
+**Requirements**:
+- Name Server must be reachable on the network (check firewall rules)
+- All machines must be on same network or have proper routing
+- Port 8000 must be open for Name Server connections
+- Storage Server client ports (e.g., 9001) must be accessible to clients
 
 ## Architecture & Data Model
 

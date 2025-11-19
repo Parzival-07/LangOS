@@ -1853,8 +1853,8 @@ int main(int argc, char const *argv[]) {
     // Avoid termination on broken pipe when NM disconnects
     signal(SIGPIPE, SIG_IGN);
 
-    if (argc != 2) {
-    LOGE_SS("Usage: %s <client_listen_port>\n", argv[0]);
+    if (argc < 2) {
+    LOGE_SS("Usage: %s <client_listen_port> [nm_ip_address]\n", argv[0]);
         return 1;
     }
 
@@ -1863,6 +1863,9 @@ int main(int argc, char const *argv[]) {
     LOGE_SS("Invalid port number.\n");
         return 1;
     }
+
+    // Parse Name Server IP (default to localhost)
+    const char* nm_ip = (argc >= 3) ? argv[2] : "127.0.0.1";
 
     // --- Start Thread to Listen for Clients ---
     pthread_t client_thread_id;
@@ -1882,12 +1885,12 @@ int main(int argc, char const *argv[]) {
     nm_address.sin_port = htons(NAME_SERVER_PORT);
 
     // Convert IPv4 address from text to binary form
-    if (inet_pton(AF_INET, "127.0.0.1", &nm_address.sin_addr) <= 0) {
+    if (inet_pton(AF_INET, nm_ip, &nm_address.sin_addr) <= 0) {
         perror("[SS] Invalid address/ Address not supported");
         return 1;
     }
 
-    LOG_SS("Connecting to Name Server at 127.0.0.1:%d...\n", NAME_SERVER_PORT);
+    LOG_SS("Connecting to Name Server at %s:%d...\n", nm_ip, NAME_SERVER_PORT);
 
     if (connect(nm_socket, (struct sockaddr *)&nm_address, sizeof(nm_address)) < 0) {
         perror("[SS] Connection Failed");
