@@ -71,9 +71,15 @@ static char* safe_strdup(const char* s) {
     return p;
 }
 
-int main() {
+int main(int argc, char** argv) {
     // Ensure sends to closed sockets don't kill the client process
     signal(SIGPIPE, SIG_IGN);
+
+    // --- Parse Command-Line Arguments ---
+    const char* nm_ip = "127.0.0.1"; // Default to localhost
+    if (argc >= 2) {
+        nm_ip = argv[1];
+    }
 
     // --- Get Username ---
     if (_term_supports_color_file(stdout)) {
@@ -101,12 +107,12 @@ int main() {
 
     nm_address.sin_family = AF_INET;
     nm_address.sin_port = htons(NAME_SERVER_PORT);
-    if (inet_pton(AF_INET, "127.0.0.1", &nm_address.sin_addr) <= 0) {
-        LOGE_CLIENT("Invalid address\n");
+    if (inet_pton(AF_INET, nm_ip, &nm_address.sin_addr) <= 0) {
+        LOGE_CLIENT("Invalid address: %s\n", nm_ip);
         return 1;
     }
 
-    LOG_CLIENT("Connecting to Name Server...\n");
+    LOG_CLIENT("Connecting to Name Server at %s:%d...\n", nm_ip, NAME_SERVER_PORT);
     if (connect(nm_socket, (struct sockaddr *)&nm_address, sizeof(nm_address)) < 0) {
         LOGE_CLIENT("Connection Failed: %s\n", strerror(errno));
         return 1;
@@ -846,7 +852,7 @@ write_cancel_release:
                 break; // Treat as NM disconnect and exit
             }
             if (!addr.found || addr.ss_port <= 0 || addr.ss_ip[0] == '\0') {
-                printf("[Client] READ failed: file not found.\n");
+                printf("[Client] READ failed (404): file not found.\n");
                 continue;
             }
 
