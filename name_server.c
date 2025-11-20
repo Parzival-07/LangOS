@@ -208,6 +208,7 @@ void handle_register_client(int slot, const MsgRegisterClient* msg);
 void send_ack(int socket);
 // Forward declarations for helpers used in handle_connection
 static int choose_ss_slot(void);
+static int is_ss_alive_nblk(int sockfd);
 static void send_error(int socket, int code, const char* msg);
 static void registry_add_file_if_absent(const char* filename, const char* owner, int ss_slot);
 static void registry_refresh_from_ss(void);
@@ -446,72 +447,75 @@ void* handle_connection(void* arg) {
             }
             LOG_NM("CREATE request filename='%s' owner='%s' from user='%s' ip=%s slot=%d\n", payload.filename, payload.owner, connections[slot].username, connections[slot].ip_addr, slot);
 
-            int ss_slot = choose_ss_slot();
-            if (ss_slot < 0) {
-                LOGE_NM("No Storage Server available for CREATE '%s'\n", payload.filename);
-                send_error(socket, 503, "No Storage Server available");
-                continue;
-            }
+            // Attempt to forward to a live SS; if the first one fails, prune it and retry once.
+            int attempts = 0;
+            while (attempts < 2) {
+                int ss_slot = choose_ss_slot();
+                if (ss_slot < 0) {
+                    LOGE_NM("No Storage Server available for CREATE '%s'\n", payload.filename);
+                    send_error(socket, 503, "No Storage Server available");
+                    break;
+                }
 
-            // Forward to SS with per-SS serialization
-            int ss_sock;
-            pthread_mutex_lock(&connections_mutex);
-            ss_sock = connections[ss_slot].socket;
-            pthread_mutex_unlock(&connections_mutex);
-         LOG_NM("Forwarding CREATE '%s' (owner=%s) to SS at %s:%d (Slot %d)\n",
-             payload.filename, payload.owner, connections[ss_slot].ip_addr, connections[ss_slot].client_port, ss_slot);
+                // Forward to SS with per-SS serialization
+                int ss_sock;
+                pthread_mutex_lock(&connections_mutex);
+                ss_sock = connections[ss_slot].socket;
+                char ss_ip_local[INET_ADDRSTRLEN];
+                int ss_cport_local = connections[ss_slot].client_port;
+                strncpy(ss_ip_local, connections[ss_slot].ip_addr, sizeof(ss_ip_local)-1);
+                ss_ip_local[sizeof(ss_ip_local)-1] = '\0';
+                pthread_mutex_unlock(&connections_mutex);
+                LOG_NM("Forwarding CREATE '%s' (owner=%s) to SS at %s:%d (Slot %d)\n",
+                       payload.filename, payload.owner, ss_ip_local, ss_cport_local, ss_slot);
 
-            pthread_mutex_lock(&connections[ss_slot].ss_io_mutex);
-            MsgHeader ss_resp;
-            do {
-                MsgHeader fwd = {0};
-                fwd.command = CMD_CREATE_FILE;
-                fwd.payload_size = sizeof(MsgCreateFile);
-                if (!send_all(ss_sock, &fwd, sizeof(fwd)) ||
-                    !send_all(ss_sock, &payload, sizeof(payload))) {
-                    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+                pthread_mutex_lock(&connections[ss_slot].ss_io_mutex);
+                MsgHeader ss_resp;
+                int ok = 1;
+                do {
+                    MsgHeader fwd = (MsgHeader){0};
+                    fwd.command = CMD_CREATE_FILE;
+                    fwd.payload_size = sizeof(MsgCreateFile);
+                    if (!send_all(ss_sock, &fwd, sizeof(fwd)) ||
+                        !send_all(ss_sock, &payload, sizeof(payload))) {
+                        ok = 0; break;
+                    }
+                    if (!recv_all(ss_sock, &ss_resp, sizeof(ss_resp))) { ok = 0; break; }
+                    LOG_NM("CREATE SS response cmd=%d payload=%d (file='%s')\n", ss_resp.command, ss_resp.payload_size, payload.filename);
+                    if (ss_resp.command == CMD_ACK) {
+                        registry_add_file_if_absent(payload.filename, payload.owner, ss_slot);
+                    }
+                    if (!send_all(socket, &ss_resp, sizeof(ss_resp))) { /* client disconnected */ }
+                    size_t remaining = ss_resp.payload_size; char buf[4096];
+                    while (remaining > 0) {
+                        size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+                        if (!recv_all(ss_sock, buf, chunk)) { ok = 0; break; }
+                        if (!send_all(socket, buf, chunk)) { break; }
+                        remaining -= chunk;
+                    }
+                } while (0);
+                pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
+
+                if (ok) {
+                    // Refresh NM cache for this file so subsequent INFO/VIEW are up-to-date
+                    registry_update_one_from_ss(ss_slot, payload.filename);
+                    break; // success
+                }
+
+                // Mark failed SS as dead and retry once with a different SS
+                LOGE_NM("SS slot %d failed during CREATE; pruning and retrying...\n", ss_slot);
+                pthread_mutex_lock(&connections_mutex);
+                int oldfd = connections[ss_slot].socket;
+                connections[ss_slot].type = CONN_TYPE_FREE;
+                connections[ss_slot].socket = -1;
+                pthread_mutex_unlock(&connections_mutex);
+                if (oldfd >= 0) close(oldfd);
+
+                attempts++;
+                if (attempts >= 2) {
                     send_error(socket, 502, "Failed to contact Storage Server");
-                    continue;
                 }
-
-                // Receive SS response here and proxy it back to the client
-                if (!recv_all(ss_sock, &ss_resp, sizeof(ss_resp))) {
-                    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
-                    send_error(socket, 502, "No response from Storage Server");
-                    continue;
-                }
-                LOG_NM("CREATE SS response cmd=%d payload=%d (file='%s')\n", ss_resp.command, ss_resp.payload_size, payload.filename);
-                // If SS acknowledged creation, update NM registry before proxying
-                if (ss_resp.command == CMD_ACK) {
-                    registry_add_file_if_absent(payload.filename, payload.owner, ss_slot);
-                }
-
-                // Send header to client
-                if (!send_all(socket, &ss_resp, sizeof(ss_resp))) {
-                    // Client disconnected
-                    pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
-                    continue;
-                }
-
-                // Forward payload in full (if any) while holding SS lock
-                size_t remaining = ss_resp.payload_size;
-                char buf[4096];
-                while (remaining > 0) {
-                    size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
-                    if (!recv_all(ss_sock, buf, chunk)) {
-                        pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
-                        send_error(socket, 502, "Failed to read SS payload");
-                        break;
-                    }
-                    if (!send_all(socket, buf, chunk)) {
-                        break;
-                    }
-                    remaining -= chunk;
-                }
-            } while (0);
-            pthread_mutex_unlock(&connections[ss_slot].ss_io_mutex);
-            // Refresh NM cache for this file so subsequent INFO/VIEW are up-to-date
-            registry_update_one_from_ss(ss_slot, payload.filename);
+            }
             continue;
         } else if (header.command == CMD_VIEW_FILES && connections[slot].type == CONN_TYPE_CLIENT) {
             // Serve from cache; only refresh if user asked for all files and cache is empty
@@ -527,15 +531,9 @@ void* handle_connection(void* arg) {
             if (!recv_all(socket, &vreq, sizeof(vreq))) { send_error(socket, 400, "Payload read failed"); continue; }
             LOG_NM("VIEW request from user='%s' ip=%s flags: show_all=%d long_list=%d\n", connections[slot].username, connections[slot].ip_addr, vreq.show_all, vreq.long_list);
 
-            if (vreq.show_all) {
-                int fc = 0;
-                pthread_mutex_lock(&file_registry_mutex);
-                fc = file_count;
-                pthread_mutex_unlock(&file_registry_mutex);
-                if (fc == 0) {
-                    registry_refresh_from_ss();
-                }
-            }
+            // Always refresh registry from all connected SS to handle topology changes
+            // This ensures VIEW is consistent even when Storage Servers switch
+            registry_refresh_from_ss();
 
             // Use authenticated requester; honor flags:
             // - show_all=0: list only files requester can access (owner/readers/writers)
@@ -656,10 +654,21 @@ void* handle_connection(void* arg) {
             if (idx >= 0) {
                 int ss_slot = file_registry[idx].ss_slot;
                 pthread_mutex_lock(&connections_mutex);
-                if (ss_slot >= 0 && ss_slot < MAX_CONNECTIONS && connections[ss_slot].type == CONN_TYPE_SS && connections[ss_slot].socket >= 0) {
+                if (ss_slot >= 0 && ss_slot < MAX_CONNECTIONS &&
+                    connections[ss_slot].type == CONN_TYPE_SS && connections[ss_slot].socket >= 0 &&
+                    is_ss_alive_nblk(connections[ss_slot].socket)) {
                     resp.found = 1;
                     strncpy(resp.ss_ip, connections[ss_slot].ip_addr, MAX_IP_LEN - 1);
                     resp.ss_port = connections[ss_slot].client_port;
+                } else if (ss_slot >= 0 && ss_slot < MAX_CONNECTIONS && connections[ss_slot].type == CONN_TYPE_SS) {
+                    // prune dead SS
+                    LOG_NM("Pruning dead SS slot %d referenced by file '%s'\n", ss_slot, req.filename);
+                    int oldfd = connections[ss_slot].socket;
+                    connections[ss_slot].type = CONN_TYPE_FREE;
+                    connections[ss_slot].socket = -1;
+                    pthread_mutex_unlock(&connections_mutex);
+                    if (oldfd >= 0) close(oldfd);
+                    pthread_mutex_lock(&connections_mutex);
                 }
                 pthread_mutex_unlock(&connections_mutex);
             }
@@ -672,10 +681,19 @@ void* handle_connection(void* arg) {
                 if (idx >= 0) {
                     int ss_slot = file_registry[idx].ss_slot;
                     pthread_mutex_lock(&connections_mutex);
-                    if (ss_slot >= 0 && ss_slot < MAX_CONNECTIONS && connections[ss_slot].type == CONN_TYPE_SS && connections[ss_slot].socket >= 0) {
+                    if (ss_slot >= 0 && ss_slot < MAX_CONNECTIONS &&
+                        connections[ss_slot].type == CONN_TYPE_SS && connections[ss_slot].socket >= 0 &&
+                        is_ss_alive_nblk(connections[ss_slot].socket)) {
                         resp.found = 1;
                         strncpy(resp.ss_ip, connections[ss_slot].ip_addr, MAX_IP_LEN - 1);
                         resp.ss_port = connections[ss_slot].client_port;
+                    } else if (ss_slot >= 0 && ss_slot < MAX_CONNECTIONS && connections[ss_slot].type == CONN_TYPE_SS) {
+                        int oldfd = connections[ss_slot].socket;
+                        connections[ss_slot].type = CONN_TYPE_FREE;
+                        connections[ss_slot].socket = -1;
+                        pthread_mutex_unlock(&connections_mutex);
+                        if (oldfd >= 0) close(oldfd);
+                        pthread_mutex_lock(&connections_mutex);
                     }
                     pthread_mutex_unlock(&connections_mutex);
                 }
@@ -1676,12 +1694,34 @@ void send_ack(int socket) {
     }
 }
 
-// Helper to pick an SS (first-fit for now)
+// Helper: quick non-blocking check whether an SS socket looks alive
+static int is_ss_alive_nblk(int sockfd) {
+    if (sockfd < 0) return 0;
+    char b;
+    ssize_t r = recv(sockfd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (r == 0) return 0; // orderly shutdown
+    if (r < 0 && (errno != EAGAIN && errno != EWOULDBLOCK)) return 0; // fatal error
+    return 1; // looks fine (no data or got data)
+}
+
+// Helper to pick an SS (first-fit alive)
 static int choose_ss_slot() {
     int ss_slot = -1;
     pthread_mutex_lock(&connections_mutex);
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (connections[i].type == CONN_TYPE_SS && connections[i].socket >= 0) {
+            int alive = is_ss_alive_nblk(connections[i].socket);
+            if (!alive) {
+                // Mark it free here to avoid repeatedly selecting a dead socket
+                LOG_NM("Pruning dead SS slot %d\n", i);
+                int oldfd = connections[i].socket;
+                connections[i].type = CONN_TYPE_FREE;
+                connections[i].socket = -1;
+                pthread_mutex_unlock(&connections_mutex);
+                if (oldfd >= 0) close(oldfd);
+                pthread_mutex_lock(&connections_mutex);
+                continue;
+            }
             ss_slot = i;
             break;
         }
