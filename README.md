@@ -787,6 +787,7 @@ ss_data/
 8. **No quota limits**: Users can create unlimited files
 9. **Fixed buffer sizes**: 16KB for file lists, 2048 bytes for sentence replacements
 10. **POSIX dependency**: Uses Linux-specific system calls (not fully portable to Windows)
+11. **No file replication**: Each file resides on exactly one Storage Server (the one where it was created). Files are NOT replicated or migrated between Storage Servers. If a Storage Server goes offline, its files become inaccessible until the server returns. This is a deliberate design choice for simplicity and is common in distributed systems without redundancy.
 
 ---
 
